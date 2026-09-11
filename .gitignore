@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Runtime data (index, uploads, rates, bills) — local only, never commit
+data/
+
+# Logs
+*.log
+logs/
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -20,26 +21,70 @@ from core.calculators import (
 )
 from core.config import (
     CHUNKS_FILE, DISCOS, DOC_TYPES, EMB_MODELS, LLM_PROVIDERS, META_FILE, RATES_FILE,
-    load_json, save_json,
+    UPLOADS_DIR, load_json, save_json,
 )
 from core.index_store import IndexStore
 from core.llm import get_llm, llm_ok
-from core.pdf_utils import OCR_OK, extract_pdf_pages
+from core.pdf_utils import OCR_OK, extract_pdf_pages, is_pdf_bytes
 from core.rag import build_memory, rag_answer
 from core.rates import rates as get_rates
 from core.utils import auto_detect_dates, norm_title, parse_date, pkrs
 
 app = FastAPI(title="SolarGrid Advisor API")
 
+# ---------------------------------------------------------------------------
+# Upload limits & CORS (overridable via env for deploys behind other hosts)
+# ---------------------------------------------------------------------------
+MAX_PDF_MB = float(os.environ.get("SGA_MAX_PDF_MB", "50"))
+MAX_PDF_BYTES = int(MAX_PDF_MB * 1024 * 1024)
+
+_cors_env = [o.strip() for o in os.environ.get("SGA_CORS_ORIGINS", "").split(",") if o.strip()]
+_allow_origins = ["http://localhost:5173", "http://127.0.0.1:5173", *{o for o in _cors_env}]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=_allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 store = IndexStore()
+
+
+async def _read_upload_pdf(file: UploadFile) -> bytes:
+    """Read + validate an uploaded PDF. Raises HTTPException with a clear message."""
+    data = await file.read()
+    name = file.filename or "upload.pdf"
+    if not data:
+        raise HTTPException(400, f"“{name}” is empty (0 bytes). Please choose a valid PDF file.")
+    if len(data) > MAX_PDF_BYTES:
+        raise HTTPException(
+            413,
+            f"“{name}” is {len(data) / 1024 / 1024:.1f} MB — the limit is {MAX_PDF_MB:g} MB. "
+            "Split the PDF or compress it and try again.",
+        )
+    if not is_pdf_bytes(data):
+        raise HTTPException(
+            400,
+            f"“{name}” doesn't look like a PDF file (only .pdf uploads are supported).",
+        )
+    return data
+
+
+def _extract_or_400(data: bytes, filename: str) -> tuple[list[str], int]:
+    """Run PDF extraction, mapping failures to actionable 400 errors."""
+    try:
+        return extract_pdf_pages(data)
+    except ValueError as e:
+        if str(e) == "encrypted":
+            raise HTTPException(
+                400,
+                f"“{filename}” is password-protected. Remove the password and upload again.",
+            )
+        raise HTTPException(400, f"“{filename}” could not be read as a PDF — the file may be corrupt.")
+    except Exception as e:
+        raise HTTPException(400, f"Could not read “{filename}”: {str(e)[:200]}")
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +97,7 @@ def health():
         "n_docs": len(load_json(META_FILE, [])),
         "n_chunks": len(store.chunks),
         "ocr_available": OCR_OK,
+        "max_pdf_mb": MAX_PDF_MB,
         "discos": DISCOS,
         "doc_types": DOC_TYPES,
         "emb_models": list(EMB_MODELS.keys()),
@@ -88,8 +134,8 @@ def _llm_pack(cfg: LLMConfig):
 # ---------------------------------------------------------------------------
 @app.post("/api/documents/preview")
 async def preview_document(file: UploadFile = File(...)):
-    data = await file.read()
-    pages, ocr_n = extract_pdf_pages(data)
+    data = await _read_upload_pdf(file)
+    pages, ocr_n = _extract_or_400(data, file.filename or "upload.pdf")
     total_chars = sum(len(p) for p in pages)
     dates = auto_detect_dates("\n".join(pages)) if total_chars > 200 else {"issue": "", "effective": ""}
     return {
@@ -98,6 +144,7 @@ async def preview_document(file: UploadFile = File(...)):
         "n_pages": len(pages),
         "total_chars": total_chars,
         "ocr_pages": ocr_n,
+        "ocr_available": OCR_OK,
         "usable": total_chars > 200,
         "detected_issue_date": dates["issue"],
         "detected_effective_date": dates["effective"],
@@ -115,15 +162,58 @@ async def upload_document(
     effective_date: str = Form(""),
     notes: str = Form(""),
 ):
-    data = await file.read()
-    pages, ocr_n = extract_pdf_pages(data)
+    data = await _read_upload_pdf(file)
+    filename = file.filename or "upload.pdf"
+    pages, ocr_n = _extract_or_400(data, filename)
     if sum(len(p) for p in pages) <= 200:
-        raise HTTPException(400, "Could not extract usable text from this PDF. If it's scanned, install tesseract-ocr and retry.")
+        if OCR_OK:
+            detail = ("Could not extract usable text from this PDF — it may be a scanned image. "
+                      "OCR ran but found too little text; try a clearer scan.")
+        else:
+            detail = ("Could not extract usable text from this PDF. If it's a scanned document, "
+                      "install tesseract-ocr on the server and retry.")
+        raise HTTPException(400, detail)
+
+    doc_id = hashlib.sha1(data).hexdigest()[:12]
+    docs = load_json(META_FILE, [])
+    existing = next((d for d in docs if d["id"] == doc_id), None)
+
+    clean_title = title.strip() or Path(filename).stem.replace("_", " ").replace("-", " ").title()
+
+    if existing is not None:
+        # Idempotent re-upload: same file → refresh metadata instead of duplicating.
+        existing.update({
+            "title": clean_title,
+            "disco": disco or existing.get("disco", "Other"),
+            "doc_type": doc_type or existing.get("doc_type", "Circular / Other"),
+            "status": status or existing.get("status", "official"),
+            "issue_date": issue_date, "effective_date": effective_date,
+            "notes": notes.strip(),
+        })
+        save_json(META_FILE, docs)
+        for c in store.chunks:
+            if c["doc_id"] == doc_id:
+                c.update({
+                    "doc_title": existing["title"], "disco": existing["disco"],
+                    "status": existing["status"], "issue_date": existing["issue_date"],
+                    "effective_date": existing["effective_date"],
+                })
+        save_json(CHUNKS_FILE, store.chunks)
+        nch = sum(1 for c in store.chunks if c["doc_id"] == doc_id)
+        return {"doc": existing, "n_chunks": nch, "duplicate": True}
+
+    # Keep the original file so uploads are traceable / rebuildable.
+    try:
+        UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+        safe_name = "".join(ch for ch in Path(filename).name if ch.isalnum() or ch in "._-") or "upload.pdf"
+        (UPLOADS_DIR / f"{doc_id}_{safe_name}").write_bytes(data)
+    except Exception:
+        pass  # indexing must not fail just because archival failed
 
     doc = {
-        "id": hashlib.sha1(data).hexdigest()[:12],
-        "filename": file.filename,
-        "title": title.strip() or Path(file.filename).stem.replace("_", " ").replace("-", " ").title(),
+        "id": doc_id,
+        "filename": filename,
+        "title": clean_title,
         "disco": disco, "doc_type": doc_type, "status": status,
         "issue_date": issue_date, "effective_date": effective_date,
         "notes": notes.strip(),
@@ -131,11 +221,13 @@ async def upload_document(
         "ocr_pages": ocr_n,
         "pages": len(pages),
     }
-    nch = store.add_document(doc, pages)
-    docs = load_json(META_FILE, [])
+    try:
+        nch = store.add_document(doc, pages)
+    except Exception as e:
+        raise HTTPException(500, f"Indexing failed: {str(e)[:300]}")
     docs.append(doc)
     save_json(META_FILE, docs)
-    return {"doc": doc, "n_chunks": nch}
+    return {"doc": doc, "n_chunks": nch, "duplicate": False}
 
 
 @app.get("/api/documents")
@@ -154,6 +246,7 @@ def list_documents():
         "documents": out,
         "n_chunks": len(store.chunks),
         "manifest": store.manifest,
+        "latest_effective": {k: v.isoformat() for k, v in latest_map.items()},
         "ocr_available": OCR_OK,
     }
 
@@ -199,6 +292,11 @@ def delete_document(doc_id: str):
     store.remove_document(doc_id)
     docs = [d for d in docs if d["id"] != doc_id]
     save_json(META_FILE, docs)
+    for p in UPLOADS_DIR.glob(f"{doc_id}_*"):
+        try:
+            p.unlink()
+        except Exception:
+            pass
     return {"deleted": doc_id}
 
 
@@ -237,15 +335,20 @@ class ChatRequest(BaseModel):
 
 @app.post("/api/chat")
 def chat(req: ChatRequest):
+    if not req.question or not req.question.strip():
+        raise HTTPException(400, "Question is empty.")
     opts = {
         "discos": req.discos, "statuses": req.statuses,
         "min_effective": req.min_effective, "latest_only": req.latest_only,
-        "top_k": req.top_k, "vector": req.vector, "bm25": req.bm25,
+        "top_k": max(1, min(req.top_k, 20)), "vector": req.vector, "bm25": req.bm25,
         "rewrite": req.rewrite, "rerank": req.rerank, "memory_enabled": req.memory_enabled,
         "memory": build_memory([m.model_dump() for m in req.history[-7:-1]]) if req.memory_enabled else "",
     }
     pack = _llm_pack(req.llm)
-    res = rag_answer(req.question, store, pack, opts)
+    try:
+        res = rag_answer(req.question, store, pack, opts)
+    except Exception as e:
+        raise HTTPException(500, f"Search failed: {str(e)[:300]}")
     score, label = res["confidence"]
     return {
         "answer": res["answer"],
@@ -405,11 +508,16 @@ async def bills_extract(
     api_key: str = Form(""),
     model: str = Form(""),
 ):
-    data = await file.read()
-    pages, _ = extract_pdf_pages(data)
+    data = await _read_upload_pdf(file)
+    filename = file.filename or "bill.pdf"
+    pages, _ = _extract_or_400(data, filename)
     text = "\n".join(pages)
     if len(text.strip()) < 100:
-        raise HTTPException(400, "No text found — this bill appears to be scanned. OCR requires tesseract.")
+        if OCR_OK:
+            detail = "No text found in this bill — OCR ran but found too little text. Try a clearer scan."
+        else:
+            detail = "No text found — this bill appears to be scanned. OCR requires tesseract."
+        raise HTTPException(400, detail)
 
     found = extract_bill(text)
     if use_llm:
@@ -432,7 +540,7 @@ async def bills_extract(
             share = pk / tu
             insights.append(f"{round(share * 100)}% of your units are used in the peak window (6–10 PM). Shifting half of them to off-peak saves roughly {pkrs(pk * 0.5 * 12)}/month (at ~Rs 13 spread).")
         else:
-            insights.append("Peak units not detected — if your DISCO bills TOU, check the \u201cpeak\u201d/\u201chigh rate\u201d line.")
+            insights.append("Peak units not detected — if your DISCO bills TOU, check the “peak”/“high rate” line.")
     if isinstance(exp, float) and exp:
         r = get_rates().get("LESCO", {"buyback": 0.85})
         insights.append(f"You exported {exp:,.0f} units — at a typical buyback of {pkrs(r['buyback'])}/unit that's only {pkrs(exp * r['buyback'])}/month. Self-consuming those units is worth ~3-4x more.")
@@ -441,7 +549,7 @@ async def bills_extract(
 
     bill_id = hashlib.sha1(data).hexdigest()[:10]
     return {
-        "bill_id": bill_id, "filename": file.filename, "fields": found,
+        "bill_id": bill_id, "filename": filename, "fields": found,
         "insights": insights, "raw_text_preview": text[:3500],
     }
 

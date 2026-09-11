@@ -16,8 +16,11 @@ faiss-cpu>=1.8
 # --- PDF text extraction + OCR for scanned PDFs ---
 pdfplumber>=0.11
 pypdf>=4.0
+pypdfium2>=4.0
 pytesseract>=0.3.10
 Pillow>=10.0
+# NOTE: OCR of scanned PDFs additionally needs the Tesseract *system* package,
+# e.g. on Ubuntu:  sudo apt install tesseract-ocr tesseract-ocr-urd
 
 # --- Data ---
 numpy>=1.24
