@@ -1,0 +1,477 @@
+"""
+SolarGrid Advisor — FastAPI backend
+Ported RAG + calculators from the original Streamlit app; see core/ for pure logic.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import hashlib
+from pathlib import Path
+from typing import Optional
+
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from core.bill import LABEL_MAP, extract_bill, llm_extract_bill
+from core.calculators import (
+    backup_hours, heuristic_plan, inverter_size, llm_plan, payback,
+    savings_calc, solar_sizing,
+)
+from core.config import (
+    CHUNKS_FILE, DISCOS, DOC_TYPES, EMB_MODELS, LLM_PROVIDERS, META_FILE, RATES_FILE,
+    load_json, save_json,
+)
+from core.index_store import IndexStore
+from core.llm import get_llm, llm_ok
+from core.pdf_utils import OCR_OK, extract_pdf_pages
+from core.rag import build_memory, rag_answer
+from core.rates import rates as get_rates
+from core.utils import auto_detect_dates, norm_title, parse_date, pkrs
+
+app = FastAPI(title="SolarGrid Advisor API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+store = IndexStore()
+
+
+# ---------------------------------------------------------------------------
+# Health & meta
+# ---------------------------------------------------------------------------
+@app.get("/api/health")
+def health():
+    return {
+        "ok": True,
+        "n_docs": len(load_json(META_FILE, [])),
+        "n_chunks": len(store.chunks),
+        "ocr_available": OCR_OK,
+        "discos": DISCOS,
+        "doc_types": DOC_TYPES,
+        "emb_models": list(EMB_MODELS.keys()),
+        "llm_providers": {k: v for k, v in LLM_PROVIDERS.items()},
+    }
+
+
+# ---------------------------------------------------------------------------
+# LLM connection test
+# ---------------------------------------------------------------------------
+class LLMConfig(BaseModel):
+    provider: str = "Offline (no LLM — retrieval only)"
+    base_url: str = ""
+    api_key: str = ""
+    model: str = ""
+    temperature: float = 0.2
+
+
+@app.post("/api/llm/test")
+def test_llm(cfg: LLMConfig):
+    pack = get_llm(cfg.provider, cfg.base_url, cfg.api_key, cfg.model, cfg.temperature)
+    if pack is None:
+        return {"ok": False, "message": "Could not build client — check the base URL."}
+    ok = llm_ok(pack)
+    return {"ok": bool(ok), "message": "Connected — model responded." if ok else "No response — check key/URL/model."}
+
+
+def _llm_pack(cfg: LLMConfig):
+    return get_llm(cfg.provider, cfg.base_url, cfg.api_key, cfg.model, cfg.temperature)
+
+
+# ---------------------------------------------------------------------------
+# Documents
+# ---------------------------------------------------------------------------
+@app.post("/api/documents/preview")
+async def preview_document(file: UploadFile = File(...)):
+    data = await file.read()
+    pages, ocr_n = extract_pdf_pages(data)
+    total_chars = sum(len(p) for p in pages)
+    dates = auto_detect_dates("\n".join(pages)) if total_chars > 200 else {"issue": "", "effective": ""}
+    return {
+        "filename": file.filename,
+        "size_kb": round(len(data) / 1024),
+        "n_pages": len(pages),
+        "total_chars": total_chars,
+        "ocr_pages": ocr_n,
+        "usable": total_chars > 200,
+        "detected_issue_date": dates["issue"],
+        "detected_effective_date": dates["effective"],
+    }
+
+
+@app.post("/api/documents/upload")
+async def upload_document(
+    file: UploadFile = File(...),
+    title: str = Form(""),
+    disco: str = Form("Other"),
+    doc_type: str = Form("Circular / Other"),
+    status: str = Form("official"),
+    issue_date: str = Form(""),
+    effective_date: str = Form(""),
+    notes: str = Form(""),
+):
+    data = await file.read()
+    pages, ocr_n = extract_pdf_pages(data)
+    if sum(len(p) for p in pages) <= 200:
+        raise HTTPException(400, "Could not extract usable text from this PDF. If it's scanned, install tesseract-ocr and retry.")
+
+    doc = {
+        "id": hashlib.sha1(data).hexdigest()[:12],
+        "filename": file.filename,
+        "title": title.strip() or Path(file.filename).stem.replace("_", " ").replace("-", " ").title(),
+        "disco": disco, "doc_type": doc_type, "status": status,
+        "issue_date": issue_date, "effective_date": effective_date,
+        "notes": notes.strip(),
+        "added": dt.datetime.now().isoformat(timespec="seconds"),
+        "ocr_pages": ocr_n,
+        "pages": len(pages),
+    }
+    nch = store.add_document(doc, pages)
+    docs = load_json(META_FILE, [])
+    docs.append(doc)
+    save_json(META_FILE, docs)
+    return {"doc": doc, "n_chunks": nch}
+
+
+@app.get("/api/documents")
+def list_documents():
+    docs = load_json(META_FILE, [])
+    latest_map = store.latest_effective_map()
+    out = []
+    for d in docs:
+        superseded = any(
+            norm_title(x["title"]) == norm_title(d["title"]) and x["id"] != d["id"]
+            and (parse_date(x.get("effective_date", "")) or dt.date(1900, 1, 1)) > (parse_date(d.get("effective_date", "")) or dt.date(1900, 1, 1))
+            for x in docs
+        )
+        out.append({**d, "superseded": superseded})
+    return {
+        "documents": out,
+        "n_chunks": len(store.chunks),
+        "manifest": store.manifest,
+        "ocr_available": OCR_OK,
+    }
+
+
+class DocMetaUpdate(BaseModel):
+    issue_date: Optional[str] = None
+    effective_date: Optional[str] = None
+    disco: Optional[str] = None
+    status: Optional[str] = None
+    notes: Optional[str] = None
+
+
+@app.patch("/api/documents/{doc_id}")
+def update_document(doc_id: str, upd: DocMetaUpdate):
+    docs = load_json(META_FILE, [])
+    found = None
+    for d in docs:
+        if d["id"] == doc_id:
+            for field in ("issue_date", "effective_date", "disco", "status", "notes"):
+                val = getattr(upd, field)
+                if val is not None:
+                    d[field] = val
+            found = d
+    if not found:
+        raise HTTPException(404, "Document not found")
+    save_json(META_FILE, docs)
+    for c in store.chunks:
+        if c["doc_id"] == doc_id:
+            for field in ("disco", "status", "issue_date", "effective_date"):
+                val = getattr(upd, field)
+                if val is not None:
+                    c[field] = val
+    save_json(CHUNKS_FILE, store.chunks)
+    return {"doc": found}
+
+
+@app.delete("/api/documents/{doc_id}")
+def delete_document(doc_id: str):
+    docs = load_json(META_FILE, [])
+    match = next((d for d in docs if d["id"] == doc_id), None)
+    if not match:
+        raise HTTPException(404, "Document not found")
+    store.remove_document(doc_id)
+    docs = [d for d in docs if d["id"] != doc_id]
+    save_json(META_FILE, docs)
+    return {"deleted": doc_id}
+
+
+@app.post("/api/documents/rebuild")
+def rebuild_index():
+    try:
+        store.rebuild_all()
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    return {"ok": True, "manifest": store.manifest}
+
+
+# ---------------------------------------------------------------------------
+# Chat (RAG)
+# ---------------------------------------------------------------------------
+class ChatMessage(BaseModel):
+    role: str
+    text: str
+
+
+class ChatRequest(BaseModel):
+    question: str
+    discos: list[str] = []
+    statuses: list[str] = ["official"]
+    min_effective: str = ""
+    latest_only: bool = True
+    top_k: int = 5
+    vector: bool = True
+    bm25: bool = True
+    rewrite: bool = False
+    rerank: bool = False
+    memory_enabled: bool = True
+    history: list[ChatMessage] = []
+    llm: LLMConfig = LLMConfig()
+
+
+@app.post("/api/chat")
+def chat(req: ChatRequest):
+    opts = {
+        "discos": req.discos, "statuses": req.statuses,
+        "min_effective": req.min_effective, "latest_only": req.latest_only,
+        "top_k": req.top_k, "vector": req.vector, "bm25": req.bm25,
+        "rewrite": req.rewrite, "rerank": req.rerank, "memory_enabled": req.memory_enabled,
+        "memory": build_memory([m.model_dump() for m in req.history[-7:-1]]) if req.memory_enabled else "",
+    }
+    pack = _llm_pack(req.llm)
+    res = rag_answer(req.question, store, pack, opts)
+    score, label = res["confidence"]
+    return {
+        "answer": res["answer"],
+        "confidence": {"score": score, "label": label},
+        "verified": res["verified"],
+        "rewritten": res["rewritten"],
+        "sources": [
+            {
+                "doc_title": c["doc_title"], "disco": c["disco"], "page": c["page"],
+                "effective_date": c.get("effective_date", ""), "text": c["text"][:600],
+                "score": c.get("score", 0),
+            }
+            for c in res["context_chunks"][:8]
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Rates
+# ---------------------------------------------------------------------------
+@app.get("/api/rates")
+def rates_endpoint():
+    return get_rates()
+
+
+class RateUpdate(BaseModel):
+    peak: float
+    offpeak: float
+    fixed: float
+    buyback: float
+
+
+@app.post("/api/rates/{disco}")
+def update_rate(disco: str, upd: RateUpdate):
+    if disco not in DISCOS:
+        raise HTTPException(400, "Unknown DISCO")
+    r = get_rates()
+    r[disco] = {"peak": upd.peak, "offpeak": upd.offpeak, "fixed": upd.fixed,
+                "buyback": upd.buyback, "note": "Updated in-app"}
+    save_json(RATES_FILE, r)
+    return {"disco": disco, "rate": r[disco]}
+
+
+# ---------------------------------------------------------------------------
+# Savings dashboard
+# ---------------------------------------------------------------------------
+class DashboardRequest(BaseModel):
+    disco: str
+    units: float = 640
+    peak_share: float = 0.25
+    shift: float = 0.4
+    solar_kwp: float = 5.0
+    sun_hours: float = 4.5
+    self_use_share: float = 0.7
+
+
+@app.post("/api/dashboard/calc")
+def dashboard_calc(req: DashboardRequest):
+    r = get_rates().get(req.disco)
+    if not r:
+        raise HTTPException(400, "Unknown DISCO")
+    rr = {"peak": float(r["peak"]), "offpeak": float(r["offpeak"]),
+          "fixed": float(r["fixed"]), "buyback": float(r["buyback"])}
+    res = savings_calc(req.units, req.peak_share, req.shift, req.solar_kwp, req.sun_hours, rr, req.self_use_share)
+    return {"rates": rr, "result": res}
+
+
+# ---------------------------------------------------------------------------
+# Solar toolkit
+# ---------------------------------------------------------------------------
+class SolarCalcRequest(BaseModel):
+    disco: str
+    daily_kwh: float = 20.0
+    sun_hours: float = 4.5
+    peak_load_kw: float = 6.0
+    battery_kwh: float = 10.0
+    cost_per_kwp: float = 150000
+    save_share: float = 0.6
+    export_share: float = 0.2
+
+
+@app.post("/api/solar/calc")
+def solar_calc(req: SolarCalcRequest):
+    r = get_rates().get(req.disco)
+    if not r:
+        raise HTTPException(400, "Unknown DISCO")
+    rr = {"peak": float(r["peak"]), "offpeak": float(r["offpeak"]),
+          "fixed": float(r["fixed"]), "buyback": float(r["buyback"])}
+    kwp = solar_sizing(req.daily_kwh, req.sun_hours)
+    inv = inverter_size(kwp, req.peak_load_kw)
+    b_hours = backup_hours(req.battery_kwh, req.peak_load_kw) if req.battery_kwh else 0.0
+    gen = kwp * req.sun_hours * 30 * 0.8
+
+    solar_month = gen * req.save_share
+    self_used = solar_month * (1 - req.export_share)
+    exported = solar_month * req.export_share
+    monthly_saving = self_used * rr["offpeak"] * 0.9 + exported * rr["buyback"]
+    cost = kwp * req.cost_per_kwp
+    yrs = payback(cost, monthly_saving)
+
+    return {
+        "rates": rr,
+        "kwp": kwp, "inverter_kw": inv, "backup_hours": b_hours, "monthly_generation_kwh": round(gen),
+        "system_cost": cost, "monthly_saving": monthly_saving, "payback_years": yrs,
+        "self_use_value": self_used * rr["offpeak"] * 0.9,
+        "export_value": exported * rr["buyback"],
+    }
+
+
+class SolarPlanRequest(BaseModel):
+    disco: str
+    monthly_units: float = 640
+    solar_kwp: float = 5.0
+    battery_kwh: float = 10.0
+    appliances: list[str] = []
+    peak_appliances: list[str] = []
+    avg_monthly_bill: float = 18000
+    use_llm: bool = True
+    llm: LLMConfig = LLMConfig()
+
+
+@app.post("/api/solar/plan")
+def solar_plan(req: SolarPlanRequest):
+    r = get_rates().get(req.disco)
+    if not r:
+        raise HTTPException(400, "Unknown DISCO")
+    rr = {"peak": float(r["peak"]), "offpeak": float(r["offpeak"]),
+          "fixed": float(r["fixed"]), "buyback": float(r["buyback"])}
+    profile = {
+        "disco": req.disco, "monthly_units": req.monthly_units, "solar_kwp": req.solar_kwp,
+        "battery_kwh": req.battery_kwh, "appliances": req.appliances,
+        "peak_appliances": req.peak_appliances, "avg_monthly_bill_pkrs": req.avg_monthly_bill,
+        "peak_rate": rr["peak"], "offpeak_rate": rr["offpeak"], "buyback": rr["buyback"],
+    }
+    rows = heuristic_plan(profile, rr)
+    llm_text = None
+    if req.use_llm:
+        pack = _llm_pack(req.llm)
+        llm_text = llm_plan(pack, profile, rr)
+
+    estimate = None
+    if req.peak_appliances:
+        estimate = req.monthly_units * 0.2 * 0.5 * (rr["peak"] - rr["offpeak"])
+
+    return {"rows": rows, "llm_plan": llm_text, "quick_estimate": estimate}
+
+
+# ---------------------------------------------------------------------------
+# Bill analyzer
+# ---------------------------------------------------------------------------
+@app.post("/api/bills/extract")
+async def bills_extract(
+    file: UploadFile = File(...),
+    use_llm: bool = Form(True),
+    provider: str = Form("Offline (no LLM — retrieval only)"),
+    base_url: str = Form(""),
+    api_key: str = Form(""),
+    model: str = Form(""),
+):
+    data = await file.read()
+    pages, _ = extract_pdf_pages(data)
+    text = "\n".join(pages)
+    if len(text.strip()) < 100:
+        raise HTTPException(400, "No text found — this bill appears to be scanned. OCR requires tesseract.")
+
+    found = extract_bill(text)
+    if use_llm:
+        pack = get_llm(provider, base_url, api_key, model)
+        if pack is not None:
+            llm_f = llm_extract_bill(pack, text)
+            if llm_f:
+                for k, v in llm_f.items():
+                    if v not in (None, "") and k in LABEL_MAP:
+                        found[LABEL_MAP[k]] = v
+
+    # quick insights
+    insights = []
+    tu = found.get("Total units")
+    pk = found.get("Peak units")
+    tot = found.get("Total amount (Rs)")
+    exp = found.get("Export units (net metering)")
+    if isinstance(tu, float) and tu:
+        if isinstance(pk, float):
+            share = pk / tu
+            insights.append(f"{round(share * 100)}% of your units are used in the peak window (6–10 PM). Shifting half of them to off-peak saves roughly {pkrs(pk * 0.5 * 12)}/month (at ~Rs 13 spread).")
+        else:
+            insights.append("Peak units not detected — if your DISCO bills TOU, check the \u201cpeak\u201d/\u201chigh rate\u201d line.")
+    if isinstance(exp, float) and exp:
+        r = get_rates().get("LESCO", {"buyback": 0.85})
+        insights.append(f"You exported {exp:,.0f} units — at a typical buyback of {pkrs(r['buyback'])}/unit that's only {pkrs(exp * r['buyback'])}/month. Self-consuming those units is worth ~3-4x more.")
+    if isinstance(tot, float) and isinstance(tu, float) and tu:
+        insights.append(f"Your effective rate is {pkrs(tot / tu)}/unit all-in — compare it against your DISCO tariff to spot anomalies.")
+
+    bill_id = hashlib.sha1(data).hexdigest()[:10]
+    return {
+        "bill_id": bill_id, "filename": file.filename, "fields": found,
+        "insights": insights, "raw_text_preview": text[:3500],
+    }
+
+
+class SaveBillRequest(BaseModel):
+    bill_id: str
+    filename: str
+    fields: dict
+
+
+@app.post("/api/bills/save")
+def bills_save(req: SaveBillRequest):
+    from core.config import BILLS_FILE
+    bills = load_json(BILLS_FILE, [])
+    bills.append({
+        "id": req.bill_id, "name": req.filename, "fields": req.fields,
+        "ts": dt.datetime.now().isoformat(timespec="seconds"),
+    })
+    save_json(BILLS_FILE, bills[-60:])
+    return {"ok": True}
+
+
+@app.get("/api/bills/history")
+def bills_history():
+    from core.config import BILLS_FILE
+    return {"bills": load_json(BILLS_FILE, [])}
+
+
+@app.delete("/api/bills/history")
+def bills_clear():
+    from core.config import BILLS_FILE
+    save_json(BILLS_FILE, [])
+    return {"ok": True}

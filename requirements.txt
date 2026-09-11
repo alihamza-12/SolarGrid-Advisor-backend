@@ -1,0 +1,23 @@
+# SolarGrid Advisor backend — Python dependencies
+# Install:  pip install -r requirements.txt
+
+# --- Web framework ---
+fastapi>=0.111
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+
+# --- LLM client (OpenAI-compatible: xAI Grok / Modal gpt-oss-120b / Ollama) ---
+openai>=1.40
+
+# --- RAG: embeddings + vector store (all local & free) ---
+sentence-transformers>=3.0
+faiss-cpu>=1.8
+
+# --- PDF text extraction + OCR for scanned PDFs ---
+pdfplumber>=0.11
+pypdf>=4.0
+pytesseract>=0.3.10
+Pillow>=10.0
+
+# --- Data ---
+numpy>=1.24

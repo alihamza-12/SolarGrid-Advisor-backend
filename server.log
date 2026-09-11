@@ -1,0 +1,17 @@
+INFO:     Started server process [388]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+INFO:     127.0.0.1:60826 - "GET /api/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60836 - "GET /api/rates HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60850 - "POST /api/dashboard/calc HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60856 - "POST /api/solar/calc HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49820 - "GET /api/health HTTP/1.1" 200 OK
+[SGA] embedding unavailable (We couldn't connect to 'https://huggingface.co' to load the files, and couldn't find them in the cached files.
+Check your internet connection or see how to run the library in offline mode at 'https://huggingface.co/docs/transformers/installation#offline-mode'.) — indexing with keyword search only
+INFO:     127.0.0.1:47960 - "POST /api/documents/upload HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56920 - "GET /api/documents HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56926 - "POST /api/chat HTTP/1.1" 200 OK
+INFO:     127.0.0.1:35338 - "POST /api/bills/extract HTTP/1.1" 200 OK
+INFO:     127.0.0.1:35352 - "POST /api/solar/plan HTTP/1.1" 200 OK
+INFO:     127.0.0.1:35356 - "DELETE /api/documents/6237054edfc5 HTTP/1.1" 200 OK
