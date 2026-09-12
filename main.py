@@ -16,7 +16,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from core.bill import BILL_PATTERNS, LABEL_MAP, crosscheck_energy, extract_bill, llm_extract_bill, meter_units, normalize_bill_text, sanitize_llm_bill, strong_periods
+from core.bill import BILL_PATTERNS, LABEL_MAP, absence_zeros, crosscheck_energy, extract_bill, llm_extract_bill, meter_units, normalize_bill_text, sanitize_llm_bill, strong_periods
 from core.calculators import (
     backup_hours, heuristic_plan, inverter_size, llm_plan, payback,
     savings_calc, solar_sizing,
@@ -699,6 +699,11 @@ async def bills_extract(
         found["Total amount (Rs)"] = rx_total
     # Explicit BILL MONTH / billing-period labels overrule the LLM (weak models
     # often substitute reading/issue/due dates for the period).
+    # Zero-fill: export/fixed are 0 (not missing) when the bill shows no such
+    # concept at all. Only fills gaps — never overrides extracted values.
+    for k, v in absence_zeros(clean).items():
+        if found.get(k) is None:
+            found[k] = v
     sf, st = strong_periods(clean)
     if sf is not None:
         found["Billing period (from)"] = sf

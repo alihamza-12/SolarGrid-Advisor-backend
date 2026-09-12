@@ -13,6 +13,9 @@ clean values, and strong_periods() / cross-checks overrule the model whenever
 the bill's own explicit labels disagree with it.
 
 Missing fields stay None ("not on this bill") — values are never invented.
+Only exception: export/fixed become 0 when the bill shows no such concept at
+all (single unidirectional meter exports nothing; no fixed line means Rs 0
+fixed) — see absence_zeros(). A TOU peak/off-peak split is never defaulted.
 """
 from __future__ import annotations
 
@@ -314,6 +317,36 @@ def extract_bill(text: str) -> dict:
     return found
 
 
+# Absence detectors for zero-filling: when the bill contains NO mention at all
+# of net-metering/export (a single unidirectional meter exports nothing) or of
+# fixed/service charges (not charged), the honest extracted value is 0 — not a
+# miss. Any mention (even value-less) disables the zero, so garbled-but-present
+# lines still surface as null for the LLM/regex to resolve instead.
+_ABSENCE_EXPORT_RE = re.compile(
+    r"\bexport\w*|\bnet[\s-]*metering|\bnet\s*meter\b|bidirectional|"
+    r"\bexcess\s*(?:units|kwh)|\bunits?\s*exported|\bimport\s*(?:units|kwh)",
+    re.I,
+)
+_ABSENCE_FIXED_RE = re.compile(
+    r"\bfixed\b|\bservice\s*charges?\b|\bdemand\s*charges?\b", re.I
+)
+
+
+def absence_zeros(text: str) -> dict:
+    """0.0 for export/fixed when the bill shows no such concept at all.
+
+    Peak/off-peak are deliberately NEVER zero-filled: a TOU split cannot be
+    defaulted (0 + 0 != total units), so single-rate bills keep honest nulls.
+    """
+    t = normalize_bill_text(text)
+    out: dict = {}
+    if not _ABSENCE_EXPORT_RE.search(t):
+        out["Export units (net metering)"] = 0.0
+    if not _ABSENCE_FIXED_RE.search(t):
+        out["Fixed charge (Rs)"] = 0.0
+    return out
+
+
 # Explicit period labels. When one of these matches, its value overrules the LLM
 # (small models love to substitute reading/issue/due dates for the period).
 _STRONG_MONTH_RE = re.compile(
@@ -327,21 +360,42 @@ _STRONG_RANGE_TO_RE = re.compile(
 )
 
 
-def strong_periods(text: str) -> tuple[Optional[str], Optional[str]]:
-    """Explicit BILL MONTH or billing-period range, else (None, None).
+# Full day-dates: "17 JUN 26" or "17/06/2026" (real month names only).
+_FULLDAY = r"\d{1,2}\s+" + _MONTHS + r"\s*\d{2,4}"
+_FULLSLASH = r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}"
+# Gap between a DATE label and its value: debris, stray singles (column spill)
+# and long ID runs (consumer/reference numbers the next line starts with) —
+# but never across a "due date" (the due date must not become the period).
+_DATE_GAP = r"(?:(?!\bdue[\s\-\u2013\u2014]*date\b)(?:[^\d]|\b\d\b|\b\d{3,}\b)){0,120}?"
+_STRONG_DATEVAL_RE = re.compile(
+    r"(?<!due[\s\-\u2013\u2014])(?<!update[\s\-\u2013\u2014])\bdate\b" + _DATE_GAP
+    + r"((?:" + _FULLDAY + r")|(?:" + _FULLSLASH + r"))",
+    re.I,
+)
+_FULLDATE_RE = re.compile(r"(?:" + _FULLDAY + r")|(?:" + _FULLSLASH + r")", re.I)
 
-    A BILL MONTH value (e.g. JUN 26) fills both from and to — that is what the
-    bill itself declares as the billing period.
+
+def strong_periods(text: str) -> tuple[Optional[str], Optional[str]]:
+    """Billing period from the bill's own date labels, else (None, None).
+
+    Precedence: an explicit "billing period from X to Y" range first, then the
+    READING DATE -> next date (normally the ISSUE DATE), then BILL MONTH in
+    both slots. The due date is never used as a period bound.
     """
     t = normalize_bill_text(text)
-    m = _STRONG_MONTH_RE.search(t)
-    if m:
-        v = f"{m.group(1)} {m.group(2)}"
-        return v, v
     f = _STRONG_RANGE_FROM_RE.search(t)
     e = _STRONG_RANGE_TO_RE.search(t)
     if f and e:
         return f.group(1), e.group(1)
+    m = _STRONG_DATEVAL_RE.search(t)
+    if m:
+        frm = m.group(1)
+        m2 = _FULLDATE_RE.search(t, m.end())
+        return frm, m2.group(0) if m2 else frm
+    m = _STRONG_MONTH_RE.search(t)
+    if m:
+        v = f"{m.group(1)} {m.group(2)}"
+        return v, v
     return None, None
 
 
@@ -351,13 +405,15 @@ def strong_periods(text: str) -> tuple[Optional[str], Optional[str]]:
 _BILL_SYSTEM = """You read Pakistani electricity bills and output JSON. Output ONLY a raw JSON object (no markdown fences, no explanation) with EXACTLY these keys:
 {"billing_period_from": "...", "billing_period_to": "...", "total_units": ..., "peak_units": ..., "offpeak_units": ..., "export_units": ..., "fixed_charge": ..., "total_amount": ..., "energy_charge": ..., "wapda": ..., "taxes": ...}
 Rules:
-1. Numbers are plain (1345, not "1,345"). A field not printed on the bill is null. Never invent values.
-2. BILL MONTH (example: JUN 26) goes in BOTH billing_period_from and billing_period_to. Never use reading, issue or due dates as the period.
-3. total_amount is the Grand Total (never Payable AFTER due date).
-4. total_units is the billed UNITS (never meter READING numbers, never the BILL HISTORY table).
-5. Ignore the 12-month BILL HISTORY table, the barcode line, and Urdu paragraphs.
+1. Numbers are plain (1345, not "1,345"). Never invent values.
+2. A field not printed on the bill is null — except export_units and fixed_charge, which are 0 when the bill has no export section / fixed-charge line at all.
+3. billing_period_from is the READING DATE and billing_period_to is the ISSUE DATE when the bill prints them (example: 17 JUN 26 and 27 JUN 26). Otherwise BILL MONTH goes in both fields. Never use the due date as a period.
+4. total_amount is the Grand Total (never Payable AFTER due date).
+5. total_units is the billed UNITS (never meter READING numbers, never the BILL HISTORY table). peak_units and offpeak_units stay null unless the bill prints TOU peak/off-peak lines.
+6. Ignore the 12-month BILL HISTORY table, the barcode line, and Urdu paragraphs.
 Example bill:
 BILL MONTH JUN 26
+READING DATE 17 JUN 26 ISSUE DATE 27 JUN 26 DUE DATE 07 JUL 26
 MF 1 PREVIOUS READING 899 PRESENT READING 963 UNITS 64
 Total Electricity Charges 2635 Subsidies 1505
 Net Electricity Charges 84.01 % 1130
@@ -365,10 +421,10 @@ Taxes 15.99 % 215 Total FPA 98 Current Bill 1247
 Grand Total 1345
 L.P. SURCHARGE 53 PAYABLE AFTER DUE DATE Till 1398 After 1450
 Example output:
-{"billing_period_from": "JUN 26", "billing_period_to": "JUN 26", "total_units": 64, "peak_units": null, "offpeak_units": null, "export_units": null, "fixed_charge": null, "total_amount": 1345, "energy_charge": 2635, "wapda": 53, "taxes": 215}"""
+{"billing_period_from": "17 JUN 26", "billing_period_to": "27 JUN 26", "total_units": 64, "peak_units": null, "offpeak_units": null, "export_units": 0, "fixed_charge": 0, "total_amount": 1345, "energy_charge": 2635, "wapda": 53, "taxes": 215}"""
 
 _BILL_USER_PREFIX = (
-    "Extract the 11 fields from this bill. BILL MONTH goes in BOTH period "
+    "Extract the 11 fields from this bill. billing_period_from is the READING DATE, billing_period_to is the ISSUE DATE "
     "fields. Output ONLY the JSON object, no other text:\n\n"
 )
 
