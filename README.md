@@ -92,6 +92,9 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 | `SGA_OCR_DPI` | `150` | Raster resolution for OCR pages. |
 | `SGA_OCR_WORKERS` | `3` | Parallel Tesseract workers (RAM-bounded). |
 | `SGA_OCR_LANG` | _(auto)_ | Tesseract languages; auto = `eng+urd` when Urdu data is installed, else `eng`. |
+| `SGA_BILL_OCR_DPI` | `300` | Bill analyzer OCR resolution (high DPI reads meter/charge digits accurately). |
+| `SGA_BILL_OCR_LANG` | `eng` | Bill analyzer OCR languages (English-only: Urdu-script mode garbles bill digits). |
+| `SGA_BILL_OCR_PSM` | `3` | Bill analyzer Tesseract page-segmentation mode. |
 | `GROQ_API_KEY` | _(none)_ | Server-side Groq key: when set, Chat + bill AI extraction work with no pasted key (a pasted key always takes precedence). |
 | `PORT` | `8000` | Set automatically by Railway; used by the start command. |
 

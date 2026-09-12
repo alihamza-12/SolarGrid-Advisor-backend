@@ -16,7 +16,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from core.bill import BILL_PATTERNS, LABEL_MAP, extract_bill, llm_extract_bill, meter_units, normalize_bill_text
+from core.bill import BILL_PATTERNS, LABEL_MAP, crosscheck_energy, extract_bill, llm_extract_bill, meter_units, normalize_bill_text
 from core.calculators import (
     backup_hours, heuristic_plan, inverter_size, llm_plan, payback,
     savings_calc, solar_sizing,
@@ -27,7 +27,7 @@ from core.config import (
 )
 from core.index_store import IndexStore
 from core.llm import effective_key, get_llm, llm_ok
-from core.pdf_utils import OCR_OK, extract_pdf_pages, is_pdf_bytes
+from core.pdf_utils import BILL_OCR_DPI, BILL_OCR_LANG, BILL_OCR_PSM, OCR_OK, extract_pdf_pages, is_pdf_bytes
 from core.rag import build_memory, rag_answer
 from core.rates import rates as get_rates
 from core.utils import auto_detect_dates, norm_title, parse_date, pkrs
@@ -115,10 +115,10 @@ async def _read_upload_pdf(file: UploadFile) -> bytes:
     return data
 
 
-def _extract_or_400(data: bytes, filename: str) -> tuple[list[str], int]:
+def _extract_or_400(data: bytes, filename: str, ocr_kwargs: dict | None = None) -> tuple[list[str], int]:
     """Run PDF extraction, mapping failures to actionable 400 errors."""
     try:
-        return extract_pdf_pages(data)
+        return extract_pdf_pages(data, **(ocr_kwargs or {}))
     except ValueError as e:
         if str(e) == "encrypted":
             raise HTTPException(
@@ -133,14 +133,17 @@ def _extract_or_400(data: bytes, filename: str) -> tuple[list[str], int]:
 EXTRACT_CACHE_MAX = 30  # max cached extractions kept on disk (each is a few 100 KB)
 
 
-def _extract_cached(data: bytes, filename: str) -> tuple[list[str], int]:
+def _extract_cached(data: bytes, filename: str, cache_variant: str = "",
+                    ocr_kwargs: dict | None = None) -> tuple[list[str], int]:
     """extract_pdf_pages + content-addressed disk cache.
 
     The UI calls preview first and upload right after with the same file; for a
     96-page scan, OCR takes minutes — without the cache that work would run twice.
+    cache_variant namespaces callers that extract with different OCR settings
+    (bills use high-DPI English-only OCR) so they never share cache entries.
     """
     key = hashlib.sha1(data).hexdigest()
-    cache_file = EXTRACT_CACHE / f"{key}.json"
+    cache_file = EXTRACT_CACHE / f"{key}{cache_variant}.json"
     try:
         if cache_file.exists():
             cached = load_json(cache_file, None)
@@ -148,7 +151,7 @@ def _extract_cached(data: bytes, filename: str) -> tuple[list[str], int]:
                 return cached["pages"], int(cached.get("ocr_pages", 0))
     except Exception:
         pass
-    pages, ocr_n = _extract_or_400(data, filename)
+    pages, ocr_n = _extract_or_400(data, filename, ocr_kwargs)
     try:
         save_json(cache_file, {"pages": pages, "ocr_pages": ocr_n})
         files = sorted(EXTRACT_CACHE.glob("*.json"), key=lambda f: f.stat().st_mtime)
@@ -643,7 +646,12 @@ async def bills_extract(
 ):
     data = await _read_upload_pdf(file)
     filename = file.filename or "bill.pdf"
-    pages, _ = _extract_cached(data, filename)
+    # Bills get their own high-DPI English-only OCR pass (cached separately),
+    # which reads meter/charge digits far more reliably than the chat default.
+    pages, _ = _extract_cached(
+        data, filename, cache_variant="-bill300",
+        ocr_kwargs={"ocr_dpi": BILL_OCR_DPI, "ocr_lang": BILL_OCR_LANG, "ocr_psm": BILL_OCR_PSM},
+    )
     text = "\n".join(pages)
     clean = normalize_bill_text(text)
     if len(clean) < 100:
@@ -675,12 +683,20 @@ async def bills_extract(
                 for k, v in llm_f.items():
                     if v not in (None, "") and k in LABEL_MAP:
                         found[LABEL_MAP[k]] = v
-    for k, v in extract_bill(clean).items():
+    rx = extract_bill(clean)
+    for k, v in rx.items():
         if found.get(k) is None:
             found[k] = v
     mu = meter_units(clean)
     if mu is not None:
         found["Total units"] = mu
+    # Cross-checks: the bill's own arithmetic / strong labels beat a mis-copied
+    # figure (OCR-garbled or LLM-misattributed) whenever they disagree.
+    found["Energy charge (Rs)"] = crosscheck_energy(found.get("Energy charge (Rs)"), clean)
+    rx_total = rx.get("Total amount (Rs)")
+    if (rx_total is not None and found.get("Total amount (Rs)") is not None
+            and rx_total != found["Total amount (Rs)"]):
+        found["Total amount (Rs)"] = rx_total
 
     # quick insights
     insights = []

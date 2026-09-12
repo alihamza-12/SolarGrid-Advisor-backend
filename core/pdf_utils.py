@@ -10,6 +10,8 @@ Two-pass strategy:
 
 Env knobs: SGA_OCR_DPI (default 150), SGA_OCR_WORKERS (default 3),
 SGA_OCR_LANG (default "" = eng+urd when Urdu data is installed, else eng).
+Bill analyzer OCR: SGA_BILL_OCR_DPI (default 300), SGA_BILL_OCR_LANG
+(default "eng"), SGA_BILL_OCR_PSM (default 3).
 """
 from __future__ import annotations
 
@@ -57,6 +59,13 @@ def _int_env(name: str, default: int) -> int:
 OCR_DPI = _int_env("SGA_OCR_DPI", 150)
 OCR_WORKERS = max(1, _int_env("SGA_OCR_WORKERS", 3))
 OCR_LANG_ENV = os.environ.get("SGA_OCR_LANG", "").strip()
+
+# Bill analyzer OCR: high-resolution English-only reads of meter/charge digits.
+# (The Urdu subsidy paragraphs on bills confuse eng+urd digit recognition, so
+# bills default to eng; chat documents keep the auto eng+urd default above.)
+BILL_OCR_DPI = _int_env("SGA_BILL_OCR_DPI", 300)
+BILL_OCR_LANG = os.environ.get("SGA_BILL_OCR_LANG", "eng").strip() or "eng"
+BILL_OCR_PSM = _int_env("SGA_BILL_OCR_PSM", 3)
 
 _ocr_lang_cache: str | None = None
 
@@ -114,14 +123,15 @@ def _ocr_targets(pages: list[str]) -> list[int]:
     return [i for i, t in enumerate(pages) if len(t) < 40 or (i in dup_idx and len(t) < 500)]
 
 
-def _tess_image(img, lang: str) -> str:
+def _tess_image(img, lang: str, psm: int = 3) -> str:
     try:
-        return (pytesseract.image_to_string(img, lang=lang) or "").strip()
+        return (pytesseract.image_to_string(img, lang=lang, config=f"--psm {psm}") or "").strip()
     except Exception:
         return ""
 
 
-def _ocr_pages_fast(data: bytes, indices: list[int]) -> dict[int, str]:
+def _ocr_pages_fast(data: bytes, indices: list[int], *, dpi: int = OCR_DPI,
+                    lang: str | None = None, psm: int = 3) -> dict[int, str]:
     """Raster + OCR the given 0-based page indices with parallel workers.
 
     Pages are rasterized one at a time (cheap) while a small pool of Tesseract
@@ -131,14 +141,14 @@ def _ocr_pages_fast(data: bytes, indices: list[int]) -> dict[int, str]:
     import threading
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    lang = _ocr_lang()
-    scale = max(1.0, OCR_DPI / 72.0)
+    lang = lang or _ocr_lang()
+    scale = max(1.0, dpi / 72.0)
     out: dict[int, str] = {}
     sem = threading.Semaphore(max(1, OCR_WORKERS * 2))
 
     def _run(img):
         try:
-            return _tess_image(img, lang)
+            return _tess_image(img, lang, psm)
         finally:
             sem.release()
 
@@ -174,16 +184,17 @@ def _ocr_pages_fast(data: bytes, indices: list[int]) -> dict[int, str]:
     return out
 
 
-def _ocr_pages_legacy(data: bytes, indices: list[int]) -> dict[int, str]:
+def _ocr_pages_legacy(data: bytes, indices: list[int], *, dpi: int = 170,
+                      lang: str | None = None, psm: int = 3) -> dict[int, str]:
     """Sequential OCR via pdfplumber rendering (used only if pypdfium2 is missing)."""
     out: dict[int, str] = {}
-    lang = _ocr_lang()
+    lang = lang or _ocr_lang()
     try:
         with pdfplumber.open(io.BytesIO(data)) as pdf:
             for i in indices:
                 try:
-                    img = pdf.pages[i].to_image(resolution=170).original.convert("L")
-                    out[i] = _tess_image(img, lang)
+                    img = pdf.pages[i].to_image(resolution=dpi).original.convert("L")
+                    out[i] = _tess_image(img, lang, psm)
                 except Exception:
                     pass
     except Exception:
@@ -191,8 +202,14 @@ def _ocr_pages_legacy(data: bytes, indices: list[int]) -> dict[int, str]:
     return out
 
 
-def extract_pdf_pages(data: bytes) -> tuple[list[str], int]:
+def extract_pdf_pages(data: bytes, *, ocr_dpi: int | None = None,
+                      ocr_lang: str | None = None,
+                      ocr_psm: int | None = None) -> tuple[list[str], int]:
     """Return (page_texts, n_ocr_pages). Text pass first, OCR only for scanned pages.
+
+    The ocr_* overrides change only the scanned-page OCR pass (native-text PDFs
+    are unaffected); omitted values keep the SGA_OCR_* defaults, so existing
+    callers (chat documents) behave exactly as before.
 
     Raises:
         ValueError: if the bytes are not a PDF or the PDF is password-protected.
@@ -242,8 +259,14 @@ def extract_pdf_pages(data: bytes) -> tuple[list[str], int]:
     if OCR_OK:
         need = _ocr_targets(pages)
         if need:
+            dpi = ocr_dpi or OCR_DPI
+            lang = ocr_lang or _ocr_lang()
+            psm = ocr_psm or 3
             try:
-                results = _ocr_pages_fast(data, need) if PDFIUM_OK else _ocr_pages_legacy(data, need)
+                if PDFIUM_OK:
+                    results = _ocr_pages_fast(data, need, dpi=dpi, lang=lang, psm=psm)
+                else:
+                    results = _ocr_pages_legacy(data, need, dpi=dpi, lang=lang, psm=psm)
             except Exception:
                 results = {}
             for i, t2 in results.items():
