@@ -6,6 +6,12 @@ and lay values out in columns. normalize_bill_text() cleans the first two proble
 before any pattern runs; main.py runs the LLM first (it reads messy layouts best)
 and uses these patterns to backfill whatever the LLM missed.
 
+The LLM prompt is deliberately small-model friendly (short rules + a worked
+example instead of long prose) because bill extraction usually runs on free /
+low-tier models; sanitize_llm_bill() then coerces whatever JSON comes back into
+clean values, and strong_periods() / cross-checks overrule the model whenever
+the bill's own explicit labels disagree with it.
+
 Missing fields stay None ("not on this bill") — values are never invented.
 """
 from __future__ import annotations
@@ -46,8 +52,10 @@ def normalize_bill_text(text: str) -> str:
 
 
 _MONEY = r"(?<![A-Za-z0-9])(\d{1,6}(?:[.,]\d{1,3})*(?:\.\d{1,2})?)"
-# Junk between a same-line label and its value: non-digit chars (OCR debris like
-# "zint", "cu'", "Rs.") or parenthetical remarks ("(see note 2)", "(Rs.)").
+# Junk between a same-line label and its value: parenthetical remarks first
+# ("(see note 2)", "(Rs.)" — tried before single chars so digits inside parens
+# are skipped as a whole), then any non-digit chars (OCR debris like "zint",
+# "cu'", "Rs.").
 _JUNK = r"(?:\([^)\n]{0,30}\)|[^\d\n])"
 _MONTHS = (
     r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|"
@@ -76,7 +84,7 @@ BILL_PATTERNS = {
         r"|(?:meter|reading)[^\n]{0,80}?units?\b\s*:?\s*(?<![A-Za-z0-9])([0-9]{1,6}(?:,[0-9]{3})*)"
         # Bare "UNITS 64" (incl. wrapped "UNITS\n64"); the lookbehinds keep TOU /
         # net-metering registers (PEAK [HOUR] UNITS, OFF-PEAK UNITS, EXPORT UNITS)
-        # from being mistaken for the total.
+        # and sub-totals from being mistaken for the total.
         r"|(?<!peak\s)(?<!peak\shour\s)"
         r"(?<!offpeak\s)(?<!off\speak\s)(?<!off-peak\s)"
         r"(?<!offpeak\shour\s)(?<!off\speak\shour\s)(?<!off-peak\shour\s)"
@@ -306,41 +314,176 @@ def extract_bill(text: str) -> dict:
     return found
 
 
+# Explicit period labels. When one of these matches, its value overrules the LLM
+# (small models love to substitute reading/issue/due dates for the period).
+_STRONG_MONTH_RE = re.compile(
+    r"bill(?:ing)?\s*month\b" + _MONTH_GAP + _MONTHS + r"\s*[- ]?(\d{2,4})", re.I
+)
+_STRONG_RANGE_FROM_RE = re.compile(
+    r"billing\s+period[^\n]{0,60}?from\s*[:\-]?\s*([0-9]{1,2}[/-][0-9]{1,2}[/-][0-9]{2,4})", re.I
+)
+_STRONG_RANGE_TO_RE = re.compile(
+    r"billing\s+period[^\n]{0,60}?to\s*[:\-]?\s*([0-9]{1,2}[/-][0-9]{1,2}[/-][0-9]{2,4})", re.I
+)
+
+
+def strong_periods(text: str) -> tuple[Optional[str], Optional[str]]:
+    """Explicit BILL MONTH or billing-period range, else (None, None).
+
+    A BILL MONTH value (e.g. JUN 26) fills both from and to — that is what the
+    bill itself declares as the billing period.
+    """
+    t = normalize_bill_text(text)
+    m = _STRONG_MONTH_RE.search(t)
+    if m:
+        v = f"{m.group(1)} {m.group(2)}"
+        return v, v
+    f = _STRONG_RANGE_FROM_RE.search(t)
+    e = _STRONG_RANGE_TO_RE.search(t)
+    if f and e:
+        return f.group(1), e.group(1)
+    return None, None
+
+
+# Few-shot system prompt, tuned for small / free-tier models: short numbered
+# rules plus one worked example (examples teach weak models far more reliably
+# than long rule prose). Kept compact so it also fits small context windows.
+_BILL_SYSTEM = """You read Pakistani electricity bills and output JSON. Output ONLY a raw JSON object (no markdown fences, no explanation) with EXACTLY these keys:
+{"billing_period_from": "...", "billing_period_to": "...", "total_units": ..., "peak_units": ..., "offpeak_units": ..., "export_units": ..., "fixed_charge": ..., "total_amount": ..., "energy_charge": ..., "wapda": ..., "taxes": ...}
+Rules:
+1. Numbers are plain (1345, not "1,345"). A field not printed on the bill is null. Never invent values.
+2. BILL MONTH (example: JUN 26) goes in BOTH billing_period_from and billing_period_to. Never use reading, issue or due dates as the period.
+3. total_amount is the Grand Total (never Payable AFTER due date).
+4. total_units is the billed UNITS (never meter READING numbers, never the BILL HISTORY table).
+5. Ignore the 12-month BILL HISTORY table, the barcode line, and Urdu paragraphs.
+Example bill:
+BILL MONTH JUN 26
+MF 1 PREVIOUS READING 899 PRESENT READING 963 UNITS 64
+Total Electricity Charges 2635 Subsidies 1505
+Net Electricity Charges 84.01 % 1130
+Taxes 15.99 % 215 Total FPA 98 Current Bill 1247
+Grand Total 1345
+L.P. SURCHARGE 53 PAYABLE AFTER DUE DATE Till 1398 After 1450
+Example output:
+{"billing_period_from": "JUN 26", "billing_period_to": "JUN 26", "total_units": 64, "peak_units": null, "offpeak_units": null, "export_units": null, "fixed_charge": null, "total_amount": 1345, "energy_charge": 2635, "wapda": 53, "taxes": 215}"""
+
+_BILL_USER_PREFIX = (
+    "Extract the 11 fields from this bill. BILL MONTH goes in BOTH period "
+    "fields. Output ONLY the JSON object, no other text:\n\n"
+)
+
+
+def _parse_llm_json(out: str) -> Optional[dict]:
+    """Parse a model's reply into a dict, tolerating weak-model formatting.
+
+    Handles markdown fences, trailing commas and all-single-quote JSON; gives
+    up (None) on anything else so the regex layer takes over.
+    """
+    if not out:
+        return None
+    t = out.strip()
+    t = re.sub(r"^```(?:json)?\s*", "", t)
+    t = re.sub(r"\s*```$", "", t)
+    m = re.search(r"\{[\s\S]*\}", t)
+    if not m:
+        return None
+    frag = m.group(0)
+    try:
+        d = json.loads(frag)
+        return d if isinstance(d, dict) else None
+    except Exception:
+        pass
+    try:
+        d = json.loads(re.sub(r",\s*([}\]])", r"\1", frag))
+        return d if isinstance(d, dict) else None
+    except Exception:
+        pass
+    if "'" in frag and '"' not in frag:
+        try:
+            py = frag.replace("'", '"')
+            py = re.sub(r"\bNone\b", "null", py)
+            py = re.sub(r"\bTrue\b", "true", py)
+            py = re.sub(r"\bFalse\b", "false", py)
+            d = json.loads(py)
+            return d if isinstance(d, dict) else None
+        except Exception:
+            pass
+    return None
+
+
+_LLM_NUM_KEYS = {
+    "total_units", "peak_units", "offpeak_units", "export_units",
+    "fixed_charge", "total_amount", "energy_charge", "wapda", "taxes",
+}
+_LLM_PERIOD_KEYS = ("billing_period_from", "billing_period_to")
+_PERIOD_RE = re.compile(
+    r"^(?:[A-Za-z]{3,9}\s+\d{2,4}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})$"
+)
+_RSCURRENCY_RE = re.compile(r"\b(rs\.?|pkr|rupees?)")
+
+
+def sanitize_llm_bill(d: dict) -> dict:
+    """Coerce a (possibly weak) model's JSON into clean field values.
+
+    Numbers: accepts real numbers plus strings like "1,345 Rs" / "Rs1345";
+    anything with other words ("about 200"), booleans, negatives or NaN becomes
+    missing so the regex layer backfills it. Periods: only strict shapes
+    ("JUN 26", "17 JUN 26", "01/08/2026") survive, tidied to upper case.
+    Unknown keys are dropped.
+    """
+    if not isinstance(d, dict):
+        return {}
+    out: dict = {}
+    for k in _LLM_NUM_KEYS:
+        v = d.get(k)
+        if v is None or v == "" or isinstance(v, bool):
+            continue
+        if isinstance(v, (int, float)):
+            f = float(v)
+        elif isinstance(v, str):
+            s = _RSCURRENCY_RE.sub("", v.strip().lower())
+            if re.search(r"[a-z]", s):
+                continue
+            m = re.search(r"-?\d[\d,]*(?:\.\d+)?", s)
+            if not m:
+                continue
+            try:
+                f = float(m.group(0).replace(",", ""))
+            except ValueError:
+                continue
+        else:
+            continue
+        if f != f or f in (float("inf"), float("-inf")) or f < 0:
+            continue
+        out[k] = f
+    for k in _LLM_PERIOD_KEYS:
+        v = d.get(k)
+        if not isinstance(v, str):
+            continue
+        s = re.sub(r"([A-Za-z])\s*-\s*(\d)", r"\1 \2", v.strip().upper())
+        s = re.sub(r"\s+", " ", s).strip(" .,;:")
+        if _PERIOD_RE.match(s):
+            out[k] = s
+    return out
+
+
 def llm_extract_bill(client_pack, text: str) -> Optional[dict]:
     if client_pack is None:
         return None
     try:
-        out = llm_chat(client_pack, [
-            {"role": "system", "content": (
-                'You extract fields from Pakistani DISCO electricity bills (IESCO, LESCO, K-Electric, etc.). '
-                'Return ONLY JSON with exactly these keys: "billing_period_from","billing_period_to",'
-                '"total_units","peak_units","offpeak_units","export_units","fixed_charge","total_amount",'
-                '"energy_charge","wapda","taxes". Numbers as plain numbers (no commas), unknown/absent fields as null. '
-                'Rules: read the CURRENT bill only — NEVER use the 12-month BILL HISTORY table, footer stubs, barcode '
-                'numbers, or Urdu-paragraph figures (subsidy text) for any field. '
-                'billing periods: from BILL MONTH (e.g. JUN 26 goes in both from and to); only an explicit from/to date '
-                'range otherwise. NEVER use reading/issue/due dates as the period. '
-                'total_units = current billed UNITS only (label UNITS / UNITS CONSUMED / TOTAL UNITS, or present-minus-'
-                'previous meter readings times MF) — never meter READING values themselves. '
-                'peak/offpeak/export_units = null unless TOU peak/off-peak or net-metering export lines are printed. '
-                'total_amount = Grand Total, or Payable WITHIN due date when the grand-total figure is missing. NEVER '
-                'Payable AFTER due date, never history/Urdu-paragraph numbers. '
-                'energy_charge = Total/Variable Electricity Charges figure (the same-row number — ignore junk words '
-                'between the label and the number). If that figure is garbled but Net Electricity Charges and Subsidies '
-                'are printed, return their sum. '
-                'wapda = the first (lower / within-due-tier) L.P. / WAPDA / F.C. / fuel surcharge amount, else null. '
-                'taxes = tax amount (FBR/GST/income tax); ignore percentages like 15.99% and registration numbers like '
-                'GST NO. fixed_charge = FIXED CHARGES line only, else null. '
-                'Copy digits exactly as printed. NEVER guess or invent values — use null when a field is not printed.'
-            )},
-            {"role": "user", "content": normalize_bill_text(text)[:8000]},
+        # Temperature 0: extraction must be deterministic, never creative.
+        # (get_llm packs are (client, model, temperature) tuples.)
+        pack = (client_pack[0], client_pack[1], 0)
+    except Exception:
+        pack = client_pack
+    try:
+        out = llm_chat(pack, [
+            {"role": "system", "content": _BILL_SYSTEM},
+            {"role": "user", "content": _BILL_USER_PREFIX + normalize_bill_text(text)[:8000]},
         ])
-        m = re.search(r"\{[\s\S]*\}", out or "")
-        if m:
-            return json.loads(m.group(0))
+        return _parse_llm_json(out)
     except Exception:
         return None
-    return None
 
 
 LABEL_MAP = {

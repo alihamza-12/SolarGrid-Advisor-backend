@@ -16,7 +16,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from core.bill import BILL_PATTERNS, LABEL_MAP, crosscheck_energy, extract_bill, llm_extract_bill, meter_units, normalize_bill_text
+from core.bill import BILL_PATTERNS, LABEL_MAP, crosscheck_energy, extract_bill, llm_extract_bill, meter_units, normalize_bill_text, sanitize_llm_bill, strong_periods
 from core.calculators import (
     backup_hours, heuristic_plan, inverter_size, llm_plan, payback,
     savings_calc, solar_sizing,
@@ -680,8 +680,8 @@ async def bills_extract(
                     llm_note = "AI extraction skipped: paste your API key in Chat (or set GROQ_API_KEY on the server), then re-extract."
             else:
                 llm_used = True
-                for k, v in llm_f.items():
-                    if v not in (None, "") and k in LABEL_MAP:
+                for k, v in sanitize_llm_bill(llm_f).items():
+                    if v is not None and k in LABEL_MAP:
                         found[LABEL_MAP[k]] = v
     rx = extract_bill(clean)
     for k, v in rx.items():
@@ -697,6 +697,13 @@ async def bills_extract(
     if (rx_total is not None and found.get("Total amount (Rs)") is not None
             and rx_total != found["Total amount (Rs)"]):
         found["Total amount (Rs)"] = rx_total
+    # Explicit BILL MONTH / billing-period labels overrule the LLM (weak models
+    # often substitute reading/issue/due dates for the period).
+    sf, st = strong_periods(clean)
+    if sf is not None:
+        found["Billing period (from)"] = sf
+    if st is not None:
+        found["Billing period (to)"] = st
 
     # quick insights
     insights = []
