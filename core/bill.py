@@ -38,28 +38,30 @@ def normalize_bill_text(text: str) -> str:
 BILL_PATTERNS = {
     "Billing period (from)": (
         r"billing\s+period[^\n]{0,60}?from\s*[:\-]?\s*([0-9]{1,2}[/-][0-9]{1,2}[/-][0-9]{2,4})"
-        r"|bill\s*month\s*:?\s*([a-z]{3,9}\s*[- ]?\d{2,4})"
+        r"|bill\s*month[^\n]{0,80}?([a-z]{3,9})\s*[- ]?(\d{2,4})"
     ),
     "Billing period (to)": (
         r"billing\s+period[^\n]{0,60}?to\s*[:\-]?\s*([0-9]{1,2}[/-][0-9]{1,2}[/-][0-9]{2,4})"
-        r"|bill\s*month\s*:?\s*([a-z]{3,9}\s*[- ]?\d{2,4})"
+        r"|bill\s*month[^\n]{0,80}?([a-z]{3,9})\s*[- ]?(\d{2,4})"
     ),
     "Total units": (
-        r"(?:total|billed)\s*units?[^\n\d]{0,20}?([0-9]{1,6}(?:[.,][0-9]{1,3})*)"
-        r"|units?\s*consumed[^\n\d]{0,20}?([0-9]{1,6}(?:[.,][0-9]{1,3})*)"
-        r"|consumption[^\n\d]{0,20}?([0-9]{1,6}(?:[.,][0-9]{1,3})*)\s*units?"
+        r"(?<!sub)(?<!sub )(?:total|billed)\s*units?[^\d]{0,10}?([0-9]{1,6}(?:[.,][0-9]{1,3})*)"
+        r"|units?\s*consumed[^\d]{0,10}?([0-9]{1,6}(?:[.,][0-9]{1,3})*)"
+        r"|consumption[^\d]{0,10}?([0-9]{1,6}(?:[.,][0-9]{1,3})*)\s*units?"
+  
+        r"|(?<!sub)(?<!sub )total[^\d]{0,10}?([0-9]{1,6}(?:[.,][0-9]{1,3})*)\s*units?"
     ),
     "Peak units": (
-        r"peak\s*(?:hour\s*)?units?[^\n\d]{0,20}?([0-9]{1,6}(?:[.,][0-9]{1,3})*)"
-        r"|units?\s*\(?peak\)?[^\n\d]{0,20}?([0-9]{1,6}(?:[.,][0-9]{1,3})*)"
+        r"(?<!off[\s-])(?<!off)peak\s*(?:hour\s*)?units?[^\d]{0,10}?([0-9]{1,6}(?:[.,][0-9]{1,3})*)"
+        r"|units?\s*\(?peak\)?[^\d]{0,10}?([0-9]{1,6}(?:[.,][0-9]{1,3})*)"
     ),
     "Off-peak units": (
-        r"off[\s-]?peak\s*(?:hour\s*)?units?[^\n\d]{0,20}?([0-9]{1,6}(?:[.,][0-9]{1,3})*)"
-        r"|units?\s*\(?off[\s-]?peak\)?[^\n\d]{0,20}?([0-9]{1,6}(?:[.,][0-9]{1,3})*)"
+        r"off[\s-]?peak\s*(?:hour\s*)?units?[^\d]{0,10}?([0-9]{1,6}(?:[.,][0-9]{1,3})*)"
+        r"|units?\s*\(?off[\s-]?peak\)?[^\d]{0,10}?([0-9]{1,6}(?:[.,][0-9]{1,3})*)"
     ),
     "Export units (net metering)": (
-        r"(?:export|excess|net[\s-]?metering)\s*units?[^\n\d]{0,20}?([0-9]{1,6}(?:[.,][0-9]{1,3})*)"
-        r"|units?\s*exported[^\n\d]{0,20}?([0-9]{1,6}(?:[.,][0-9]{1,3})*)"
+        r"(?:export|excess|net[\s-]?metering)\s*units?[^\d]{0,10}?([0-9]{1,6}(?:[.,][0-9]{1,3})*)"
+        r"|units?\s*exported[^\d]{0,10}?([0-9]{1,6}(?:[.,][0-9]{1,3})*)"
     ),
     "Fixed charge (Rs)": (
         r"fixed\s*charges?[^\n\d]{0,30}?(?:rs\.?\s*)?([0-9]{1,6}(?:[.,][0-9]{1,3})*)(?:\.[0-9]{1,2})?"
@@ -85,14 +87,25 @@ def extract_bill(text: str) -> dict:
     for label, pat in BILL_PATTERNS.items():
         m = re.search(pat, text, re.I)
         if m:
-            raw = next((g for g in m.groups() if g), None)
-            if raw is None:
+            groups = [g for g in m.groups() if g]
+            if not groups:
                 continue
+            raw = " ".join(groups) if label.startswith("Billing period") else groups[0]
             raw = raw.replace(",", "")
             try:
                 found[label] = float(raw) if label.endswith("(Rs)") or "units" in label.lower() or "Export" in label else raw
             except ValueError:
                 found[label] = raw
+    if "Total units" not in found:
+        # IESCO-style fallback: derive units from meter readings.
+        rm = re.search(r"previous[^\d]{0,30}?(\d{1,7})[^\d]{0,60}?present[^\d]{0,30}?(\d{1,7})", text, re.I)
+        if rm:
+            try:
+                prev, pres = int(rm.group(1)), int(rm.group(2))
+                if 100 < pres and 0 < pres - prev < 100000:
+                    found["Total units"] = float(pres - prev)
+            except ValueError:
+                pass
     return found
 
 

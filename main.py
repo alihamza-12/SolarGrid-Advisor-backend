@@ -16,7 +16,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from core.bill import LABEL_MAP, extract_bill, llm_extract_bill
+from core.bill import BILL_PATTERNS, LABEL_MAP, extract_bill, llm_extract_bill, normalize_bill_text
 from core.calculators import (
     backup_hours, heuristic_plan, inverter_size, llm_plan, payback,
     savings_calc, solar_sizing,
@@ -645,19 +645,27 @@ async def bills_extract(
     filename = file.filename or "bill.pdf"
     pages, _ = _extract_cached(data, filename)
     text = "\n".join(pages)
-    if len(text.strip()) < 100:
+    clean = normalize_bill_text(text)
+    if len(clean) < 100:
         if OCR_OK:
             detail = "No text found in this bill — OCR ran but found too little text. Try a clearer scan."
         else:
             detail = "No text found — this bill appears to be scanned. OCR requires tesseract."
         raise HTTPException(400, detail)
 
-    found = extract_bill(text)
+    found = extract_bill(clean)
+    llm_used = False
+    llm_note = None
     if use_llm:
         pack = get_llm(provider, base_url, api_key, model)
-        if pack is not None:
-            llm_f = llm_extract_bill(pack, text)
-            if llm_f:
+        if pack is None:
+            llm_note = "AI extraction skipped: set the provider and paste your API key in Chat, then re-extract."
+        else:
+            llm_f = llm_extract_bill(pack, clean)
+            if not llm_f:
+                llm_note = "AI extraction failed (check the API key in Chat) — showing regex results only."
+            else:
+                llm_used = True
                 for k, v in llm_f.items():
                     if v not in (None, "") and k in LABEL_MAP:
                         found[LABEL_MAP[k]] = v
@@ -685,7 +693,9 @@ async def bills_extract(
     gc.collect()
     return {
         "bill_id": bill_id, "filename": filename, "fields": found,
-        "insights": insights, "raw_text_preview": text[:3500],
+        "insights": insights, "raw_text_preview": clean[:3500],
+        "llm_used": llm_used, "llm_note": llm_note,
+        "total_fields": len(BILL_PATTERNS),
     }
 
 
