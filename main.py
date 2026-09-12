@@ -5,6 +5,7 @@ Ported RAG + calculators from the original Streamlit app; see core/ for pure log
 from __future__ import annotations
 
 import datetime as dt
+import gc
 import hashlib
 import os
 from pathlib import Path
@@ -38,6 +39,11 @@ app = FastAPI(title="SolarGrid Advisor API")
 MAX_PDF_MB = float(os.environ.get("SGA_MAX_PDF_MB", "50"))
 MAX_PDF_BYTES = int(MAX_PDF_MB * 1024 * 1024)
 
+# Zero-PDF-footprint mode (default): an uploaded PDF is read once, indexed as
+# tiny text chunks, and never stored on the server — no heavy files stay on
+# disk or in RAM. Set SGA_KEEP_PDFS=1 to archive originals under data/uploads/.
+KEEP_PDFS = os.environ.get("SGA_KEEP_PDFS", "0") == "1"
+
 _cors_env = [o.strip() for o in os.environ.get("SGA_CORS_ORIGINS", "").split(",") if o.strip()]
 _allow_origins = ["http://localhost:5173", "http://127.0.0.1:5173", *{o for o in _cors_env}]
 
@@ -50,6 +56,42 @@ app.add_middleware(
 )
 
 store = IndexStore()
+
+
+def _purge_server_footprint() -> None:
+    """Startup cleanup so nothing heavy lingers on the server.
+
+    - data/uploads/*.pdf are never read back by any endpoint (indexing and
+      chat use the text chunks only), so in default mode they are dead weight.
+    - data/cache/huggingface may hold a partial embedding-model download left
+      by the old full build; the light build never downloads models, so in
+      light mode that space can be reclaimed safely.
+    """
+    try:
+        if not KEEP_PDFS and UPLOADS_DIR.exists():
+            n = 0
+            for p in UPLOADS_DIR.glob("*"):
+                try:
+                    if p.is_file():
+                        p.unlink()
+                        n += 1
+                except Exception:
+                    pass
+            if n:
+                print(f"[startup] removed {n} archived PDF(s) from uploads/ (zero-footprint mode)")
+        import importlib.util
+        full_build = importlib.util.find_spec("sentence_transformers") is not None
+        if not full_build:
+            hf_cache = UPLOADS_DIR.parent / "cache" / "huggingface"
+            if hf_cache.exists():
+                import shutil
+                shutil.rmtree(hf_cache, ignore_errors=True)
+                print("[startup] cleared stale partial model download (light build needs no models)")
+    except Exception as e:
+        print(f"[startup] footprint cleanup skipped: {e}")
+
+
+_purge_server_footprint()
 
 
 async def _read_upload_pdf(file: UploadFile) -> bytes:
@@ -98,6 +140,7 @@ def health():
         "n_chunks": len(store.chunks),
         "ocr_available": OCR_OK,
         "max_pdf_mb": MAX_PDF_MB,
+        "keep_pdfs": KEEP_PDFS,
         "discos": DISCOS,
         "doc_types": DOC_TYPES,
         "emb_models": list(EMB_MODELS.keys()),
@@ -138,9 +181,12 @@ async def preview_document(file: UploadFile = File(...)):
     pages, ocr_n = _extract_or_400(data, file.filename or "upload.pdf")
     total_chars = sum(len(p) for p in pages)
     dates = auto_detect_dates("\n".join(pages)) if total_chars > 200 else {"issue": "", "effective": ""}
+    size_kb = round(len(data) / 1024)
+    del data
+    gc.collect()
     return {
         "filename": file.filename,
-        "size_kb": round(len(data) / 1024),
+        "size_kb": size_kb,
         "n_pages": len(pages),
         "total_chars": total_chars,
         "ocr_pages": ocr_n,
@@ -200,15 +246,19 @@ async def upload_document(
                 })
         save_json(CHUNKS_FILE, store.chunks)
         nch = sum(1 for c in store.chunks if c["doc_id"] == doc_id)
+        del data
+        gc.collect()
         return {"doc": existing, "n_chunks": nch, "duplicate": True}
 
-    # Keep the original file so uploads are traceable / rebuildable.
-    try:
-        UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-        safe_name = "".join(ch for ch in Path(filename).name if ch.isalnum() or ch in "._-") or "upload.pdf"
-        (UPLOADS_DIR / f"{doc_id}_{safe_name}").write_bytes(data)
-    except Exception:
-        pass  # indexing must not fail just because archival failed
+    # Zero-footprint default: the PDF bytes were indexed above and are dropped —
+    # only tiny text chunks stay on the server. Archive the original only if asked.
+    if KEEP_PDFS:
+        try:
+            UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+            safe_name = "".join(ch for ch in Path(filename).name if ch.isalnum() or ch in "._-") or "upload.pdf"
+            (UPLOADS_DIR / f"{doc_id}_{safe_name}").write_bytes(data)
+        except Exception:
+            pass  # indexing must not fail just because archival failed
 
     doc = {
         "id": doc_id,
@@ -227,6 +277,8 @@ async def upload_document(
         raise HTTPException(500, f"Indexing failed: {str(e)[:300]}")
     docs.append(doc)
     save_json(META_FILE, docs)
+    del data
+    gc.collect()
     return {"doc": doc, "n_chunks": nch, "duplicate": False}
 
 
@@ -548,6 +600,8 @@ async def bills_extract(
         insights.append(f"Your effective rate is {pkrs(tot / tu)}/unit all-in — compare it against your DISCO tariff to spot anomalies.")
 
     bill_id = hashlib.sha1(data).hexdigest()[:10]
+    del data
+    gc.collect()
     return {
         "bill_id": bill_id, "filename": filename, "fields": found,
         "insights": insights, "raw_text_preview": text[:3500],

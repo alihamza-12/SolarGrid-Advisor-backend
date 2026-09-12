@@ -2,7 +2,16 @@
 from __future__ import annotations
 
 import io
+import logging
 import shutil
+
+# pdfminer/pdfplumber are chatty: real-world PDFs (common in DISCO bills and
+# NEPRA circulars) often carry malformed font metadata, which triggers
+# per-page warnings like "Could not get FontBBox from font descriptor ...".
+# Those are noise — extraction continues and our character-count checks
+# validate the result — so keep only real errors from these loggers.
+for _log_name in ("pdfminer", "pdfplumber"):
+    logging.getLogger(_log_name).setLevel(logging.ERROR)
 
 try:
     import pdfplumber
