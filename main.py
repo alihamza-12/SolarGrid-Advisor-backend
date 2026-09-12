@@ -16,7 +16,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from core.bill import BILL_PATTERNS, LABEL_MAP, extract_bill, llm_extract_bill, normalize_bill_text
+from core.bill import BILL_PATTERNS, LABEL_MAP, extract_bill, llm_extract_bill, meter_units, normalize_bill_text
 from core.calculators import (
     backup_hours, heuristic_plan, inverter_size, llm_plan, payback,
     savings_calc, solar_sizing,
@@ -26,7 +26,7 @@ from core.config import (
     EXTRACT_CACHE, UPLOADS_DIR, load_json, save_json,
 )
 from core.index_store import IndexStore
-from core.llm import get_llm, llm_ok
+from core.llm import effective_key, get_llm, llm_ok
 from core.pdf_utils import OCR_OK, extract_pdf_pages, is_pdf_bytes
 from core.rag import build_memory, rag_answer
 from core.rates import rates as get_rates
@@ -653,7 +653,8 @@ async def bills_extract(
             detail = "No text found — this bill appears to be scanned. OCR requires tesseract."
         raise HTTPException(400, detail)
 
-    found = extract_bill(clean)
+    # All 11 labels, always in order; missing stays None ("not on this bill").
+    found: dict = {label: None for label in BILL_PATTERNS}
     llm_used = False
     llm_note = None
     if use_llm:
@@ -663,12 +664,23 @@ async def bills_extract(
         else:
             llm_f = llm_extract_bill(pack, clean)
             if not llm_f:
-                llm_note = "AI extraction failed (check the API key in Chat) — showing regex results only."
+                if (api_key or "").strip():
+                    llm_note = "AI extraction failed (check the API key in Chat) — showing regex results only."
+                elif effective_key(provider, ""):
+                    llm_note = "AI extraction failed (the server Groq key looks invalid) — showing regex results only."
+                else:
+                    llm_note = "AI extraction skipped: paste your API key in Chat (or set GROQ_API_KEY on the server), then re-extract."
             else:
                 llm_used = True
                 for k, v in llm_f.items():
                     if v not in (None, "") and k in LABEL_MAP:
                         found[LABEL_MAP[k]] = v
+    for k, v in extract_bill(clean).items():
+        if found.get(k) is None:
+            found[k] = v
+    mu = meter_units(clean)
+    if mu is not None:
+        found["Total units"] = mu
 
     # quick insights
     insights = []
