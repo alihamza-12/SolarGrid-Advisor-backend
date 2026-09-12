@@ -8,6 +8,7 @@ import datetime as dt
 import gc
 import hashlib
 import os
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -161,6 +162,27 @@ def _extract_cached(data: bytes, filename: str) -> tuple[list[str], int]:
     return pages, ocr_n
 
 
+def _repeated_pages(pages: list[str]) -> set[int]:
+    """Indices of pages whose full text duplicates another page's text.
+
+    A repeated full-page text means a template artifact (e-signature stamp,
+    copied header) rather than real content — the signature of a scanned PDF
+    whose native text layer carries nothing useful.
+    """
+    first_seen: dict[str, int] = {}
+    dups: set[int] = set()
+    for i, t in enumerate(pages):
+        k = re.sub(r"\s+", " ", (t or "").strip().lower())
+        if len(k) < 20:
+            continue
+        if k in first_seen:
+            dups.add(i)
+            dups.add(first_seen[k])
+        else:
+            first_seen[k] = i
+    return dups
+
+
 # ---------------------------------------------------------------------------
 # Health & meta
 # ---------------------------------------------------------------------------
@@ -212,8 +234,17 @@ async def preview_document(file: UploadFile = File(...)):
     data = await _read_upload_pdf(file)
     pages, ocr_n = _extract_cached(data, file.filename or "upload.pdf")
     total_chars = sum(len(p) for p in pages)
+    dup_idx = _repeated_pages(pages)
+    looks_scanned = len(dup_idx) >= 3 and len(dup_idx) >= len(pages) // 2
+    usable = total_chars > 200 and not (looks_scanned and ocr_n == 0)
     dates = auto_detect_dates("\n".join(pages)) if total_chars > 200 else {"issue": "", "effective": ""}
     size_kb = round(len(data) / 1024)
+    warning = None
+    if looks_scanned and ocr_n == 0:
+        if OCR_OK:
+            warning = (f"Only a repeated stamp/header was readable on {len(dup_idx)} pages and OCR found nothing more — try a clearer scan.")
+        else:
+            warning = (f"This looks like a scanned PDF (only a repeated stamp/header repeats on {len(dup_idx)} pages) and OCR is not available on the server, so its real content cannot be read.")
     del data
     gc.collect()
     return {
@@ -223,7 +254,9 @@ async def preview_document(file: UploadFile = File(...)):
         "total_chars": total_chars,
         "ocr_pages": ocr_n,
         "ocr_available": OCR_OK,
-        "usable": total_chars > 200,
+        "usable": usable,
+        "repeated_pages": len(dup_idx),
+        "warning": warning,
         "detected_issue_date": dates["issue"],
         "detected_effective_date": dates["effective"],
     }
@@ -243,8 +276,17 @@ async def upload_document(
     data = await _read_upload_pdf(file)
     filename = file.filename or "upload.pdf"
     pages, ocr_n = _extract_cached(data, filename)
-    if sum(len(p) for p in pages) <= 200:
-        if OCR_OK:
+    dup_idx = _repeated_pages(pages)
+    looks_scanned = len(dup_idx) >= 3 and len(dup_idx) >= len(pages) // 2
+    if sum(len(p) for p in pages) <= 200 or (looks_scanned and ocr_n == 0):
+        if looks_scanned and ocr_n == 0:
+            if OCR_OK:
+                detail = (f"This PDF looks scanned — only a repeated stamp/header repeats on {len(dup_idx)} pages "
+                          "and OCR could not read the pages. Try a clearer scan.")
+            else:
+                detail = (f"This PDF looks scanned — only a repeated stamp/header repeats on {len(dup_idx)} pages. "
+                          "OCR is not available on the server, so its content cannot be read.")
+        elif OCR_OK:
             detail = ("Could not extract usable text from this PDF — it may be a scanned image. "
                       "OCR ran but found too little text; try a clearer scan.")
         else:
@@ -381,6 +423,12 @@ def delete_document(doc_id: str):
             p.unlink()
         except Exception:
             pass
+    # Evict the cached extraction so a re-upload re-reads the file with current code.
+    for p in EXTRACT_CACHE.glob(f"{doc_id}*.json"):
+        try:
+            p.unlink()
+        except Exception:
+            pass
     return {"deleted": doc_id}
 
 
@@ -427,6 +475,7 @@ def chat(req: ChatRequest):
         "top_k": max(1, min(req.top_k, 20)), "vector": req.vector, "bm25": req.bm25,
         "rewrite": req.rewrite, "rerank": req.rerank, "memory_enabled": req.memory_enabled,
         "memory": build_memory([m.model_dump() for m in req.history[-7:-1]]) if req.memory_enabled else "",
+        "docs": load_json(META_FILE, []),
     }
     pack = _llm_pack(req.llm)
     try:

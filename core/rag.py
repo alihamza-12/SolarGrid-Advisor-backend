@@ -14,6 +14,58 @@ from .index_store import IndexStore
 from .llm import llm_chat
 from .utils import parse_date
 
+_DOC_LIST_PATTERNS = [
+    # "list/show/display ... documents/pdfs/files"
+    re.compile(r"\b(list|show|display)\b.{0,30}\b(pdfs?|documents?|files?|circulars?|notifications?)\b", re.I),
+    # "which/what pdf/document ... have/you/uploaded/indexed/available"
+    re.compile(r"\b(which|what)\b.{0,25}\b(pdfs?|documents?|files?|circulars?)\b.{0,35}\b(have|you|uploaded|indexed|available|stored|there|got)\b", re.I),
+    # Roman Urdu: "kon se/si documents/pdfs hain"
+    re.compile(r"\bkon\s?s[aeiou]\b.{0,25}\b(documents?|pdfs?|files?)\b", re.I),
+    # Urdu script: دستاویز / فہرست + question word
+    re.compile(r"(دستاویز|فہرست).{0,30}(کون|کیا|کتنی|ہیں|ہے|بتا|دکھا)"),
+]
+
+
+def _is_doc_list_query(question: str) -> bool:
+    q = question or ""
+    return any(rx.search(q) for rx in _DOC_LIST_PATTERNS)
+
+
+def _doc_list_answer(docs: list[dict], question: str) -> dict:
+    """Answer 'which PDFs do you have' directly from the document metadata."""
+    urdu = bool(re.search(r"[\u0600-\u06FF]", question or ""))
+    if not docs:
+        if urdu:
+            answer = "📂 **ابھی کوئی دستاویز موجود نہیں۔** پہلے Documents صفحے پر PDF اپ لوڈ کریں۔"
+        else:
+            answer = ("📂 **No documents are indexed yet.** Upload a PDF on the Documents page first, "
+                      "then ask me about tariffs, peak hours, or net metering.")
+        return {"answer": answer, "context_chunks": [], "confidence": (0.5, "No documents yet"),
+                "verified": True, "rewritten": None}
+    lines = []
+    for i, d in enumerate(docs, 1):
+        title = (d.get("title") or d.get("filename") or "doc").strip()
+        meta = []
+        if d.get("disco"):
+            meta.append(str(d["disco"]))
+        if d.get("doc_type"):
+            meta.append(str(d["doc_type"]))
+        if d.get("pages"):
+            meta.append(f"{d['pages']} pages")
+        eff = d.get("effective_date") or ""
+        meta.append(f"effective {eff}" if eff else "effective n.d.")
+        lines.append(f"{i}. **{title}** — {', '.join(meta)}")
+    if urdu:
+        header = f"📂 **چیٹ کے لیے میرے پاس {len(docs)} دستاویز ہیں:**"
+        footer = "ان دستاویزات سے ٹیرف، پیک آورز یا نیٹ میٹرنگ کے بارے میں پوچھیں۔"
+    else:
+        header = f"📂 **I have {len(docs)} document(s) for chat:**"
+        footer = "Ask me about tariffs, peak hours, net metering, or buyback rates from these documents."
+    answer = header + "\n\n" + "\n".join(lines) + "\n\n" + footer
+    return {"answer": answer, "context_chunks": [], "confidence": (0.97, "High confidence"),
+            "verified": True, "rewritten": None}
+
+
 SYSTEM_PROMPT = """You are SolarGrid Advisor (سولر گرڈ ایڈوائزر), an expert energy assistant for Pakistan.
 You help solar panel owners and electricity customers understand DISCO billing, time-of-use tariffs,
 peak/off-peak hours, net-metering, and buyback rates.
@@ -116,6 +168,8 @@ def build_memory(msgs: list[dict]) -> str:
 
 def rag_answer(question: str, store: IndexStore, client_pack, opts: dict) -> dict:
     """Full RAG pipeline. Returns dict(answer, context_chunks, confidence, verified, rewritten)."""
+    if _is_doc_list_query(question):
+        return _doc_list_answer(opts.get("docs") or [], question)
     filters = {
         "discos": opts.get("discos") or [],
         "statuses": opts.get("statuses") or [],

@@ -36,7 +36,7 @@ MANIFEST_FILE = INDEX_DIR / "manifest.json"
 RATES_FILE = DATA / "rates.json"
 BILLS_FILE = DATA / "bills.json"
 HF_CACHE = DATA / "cache" / "huggingface"
-EXTRACT_CACHE = DATA / "cache" / "extract"
+EXTRACT_CACHE = DATA / "cache" / "extract-v2"
 EXTRACT_CACHE.mkdir(parents=True, exist_ok=True)
 
 

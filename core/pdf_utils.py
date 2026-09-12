@@ -2,9 +2,11 @@
 
 Two-pass strategy:
   1. Fast text pass (pdfplumber) over all pages.
-  2. OCR pass (Tesseract) only for pages with almost no text — rasterized with
-     pypdfium2 and read by several Tesseract workers in parallel, so even a
-     96-page scan finishes in a few minutes inside ~1 GB RAM.
+  2. OCR pass (Tesseract) for pages with almost no native text AND for pages
+     whose text is a short duplicate of another page's text — that pattern
+     means a template artifact (e-signature stamp, repeated header) sitting on
+     a scanned image, not real content. OCR runs on several Tesseract workers
+     in parallel, so even a 96-page scan finishes in a few minutes in ~1 GB RAM.
 
 Env knobs: SGA_OCR_DPI (default 150), SGA_OCR_WORKERS (default 3),
 SGA_OCR_LANG (default "" = eng+urd when Urdu data is installed, else eng).
@@ -14,6 +16,7 @@ from __future__ import annotations
 import io
 import logging
 import os
+import re
 import shutil
 
 # pdfminer/pdfplumber are chatty: real-world PDFs (common in DISCO bills and
@@ -83,6 +86,32 @@ def _is_encrypted(data: bytes) -> bool:
         return bool(getattr(PdfReader(io.BytesIO(data)), "is_encrypted", False))
     except Exception:
         return False
+
+
+def _norm_dup(t: str) -> str:
+    return re.sub(r"\s+", " ", (t or "").strip().lower())
+
+
+def _ocr_targets(pages: list[str]) -> list[int]:
+    """Return 0-based indices of pages that need OCR.
+
+    A page needs OCR when it has almost no native text (<40 chars) — the
+    classic scanned page — or when its short text duplicates another page's
+    text, which marks it as a template artifact (e-signature stamp, repeated
+    header) on top of a scanned image rather than real content.
+    """
+    first_seen: dict[str, int] = {}
+    dup_idx: set[int] = set()
+    for i, t in enumerate(pages):
+        k = _norm_dup(t)
+        if len(k) < 20:
+            continue
+        if k in first_seen:
+            dup_idx.add(i)
+            dup_idx.add(first_seen[k])
+        else:
+            first_seen[k] = i
+    return [i for i, t in enumerate(pages) if len(t) < 40 or (i in dup_idx and len(t) < 500)]
 
 
 def _tess_image(img, lang: str) -> str:
@@ -208,17 +237,19 @@ def extract_pdf_pages(data: bytes) -> tuple[list[str], int]:
         except Exception:
             return [""], 0
 
-    # OCR pass: only pages with almost no native text (scanned/image pages).
+    # OCR pass for scanned pages (near-empty or stamp-duplicate text).
     ocr_n = 0
     if OCR_OK:
-        need = [i for i, t in enumerate(pages) if len(t) < 40]
+        need = _ocr_targets(pages)
         if need:
             try:
                 results = _ocr_pages_fast(data, need) if PDFIUM_OK else _ocr_pages_legacy(data, need)
             except Exception:
                 results = {}
             for i, t2 in results.items():
-                if t2 and len(t2) > len(pages[i]):
+                # Only trust OCR when it found substantially more than the
+                # native text — keeps clean native text and filters OCR noise.
+                if t2 and len(t2) > max(len(pages[i]), 40) * 1.5:
                     pages[i] = t2
                     ocr_n += 1
     return pages, ocr_n
