@@ -36,6 +36,8 @@ MANIFEST_FILE = INDEX_DIR / "manifest.json"
 RATES_FILE = DATA / "rates.json"
 BILLS_FILE = DATA / "bills.json"
 HF_CACHE = DATA / "cache" / "huggingface"
+EXTRACT_CACHE = DATA / "cache" / "extract"
+EXTRACT_CACHE.mkdir(parents=True, exist_ok=True)
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -74,7 +76,11 @@ EMB_MODELS = {
 DEFAULT_EMB_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
 
 LLM_PROVIDERS = {
-    "gpt-oss-120b (Modal — free, recommended)": {
+    "Groq (free, recommended)": {
+        "base": "https://api.groq.com/openai/v1", "model": "openai/gpt-oss-120b",
+        "hint": "Free key at console.groq.com — paste it as the API key.",
+    },
+    "gpt-oss-120b (Modal — free)": {
         "base": "", "model": "openai/gpt-oss-120b",
         "hint": "Paste your Modal endpoint URL, e.g. https://<app>-<user>.modal.live",
     },

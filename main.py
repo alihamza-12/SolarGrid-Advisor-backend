@@ -22,7 +22,7 @@ from core.calculators import (
 )
 from core.config import (
     CHUNKS_FILE, DISCOS, DOC_TYPES, EMB_MODELS, LLM_PROVIDERS, META_FILE, RATES_FILE,
-    UPLOADS_DIR, load_json, save_json,
+    EXTRACT_CACHE, UPLOADS_DIR, load_json, save_json,
 )
 from core.index_store import IndexStore
 from core.llm import get_llm, llm_ok
@@ -129,6 +129,38 @@ def _extract_or_400(data: bytes, filename: str) -> tuple[list[str], int]:
         raise HTTPException(400, f"Could not read “{filename}”: {str(e)[:200]}")
 
 
+EXTRACT_CACHE_MAX = 30  # max cached extractions kept on disk (each is a few 100 KB)
+
+
+def _extract_cached(data: bytes, filename: str) -> tuple[list[str], int]:
+    """extract_pdf_pages + content-addressed disk cache.
+
+    The UI calls preview first and upload right after with the same file; for a
+    96-page scan, OCR takes minutes — without the cache that work would run twice.
+    """
+    key = hashlib.sha1(data).hexdigest()
+    cache_file = EXTRACT_CACHE / f"{key}.json"
+    try:
+        if cache_file.exists():
+            cached = load_json(cache_file, None)
+            if isinstance(cached, dict) and isinstance(cached.get("pages"), list):
+                return cached["pages"], int(cached.get("ocr_pages", 0))
+    except Exception:
+        pass
+    pages, ocr_n = _extract_or_400(data, filename)
+    try:
+        save_json(cache_file, {"pages": pages, "ocr_pages": ocr_n})
+        files = sorted(EXTRACT_CACHE.glob("*.json"), key=lambda f: f.stat().st_mtime)
+        for old in files[:-EXTRACT_CACHE_MAX]:
+            try:
+                old.unlink()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return pages, ocr_n
+
+
 # ---------------------------------------------------------------------------
 # Health & meta
 # ---------------------------------------------------------------------------
@@ -178,7 +210,7 @@ def _llm_pack(cfg: LLMConfig):
 @app.post("/api/documents/preview")
 async def preview_document(file: UploadFile = File(...)):
     data = await _read_upload_pdf(file)
-    pages, ocr_n = _extract_or_400(data, file.filename or "upload.pdf")
+    pages, ocr_n = _extract_cached(data, file.filename or "upload.pdf")
     total_chars = sum(len(p) for p in pages)
     dates = auto_detect_dates("\n".join(pages)) if total_chars > 200 else {"issue": "", "effective": ""}
     size_kb = round(len(data) / 1024)
@@ -210,7 +242,7 @@ async def upload_document(
 ):
     data = await _read_upload_pdf(file)
     filename = file.filename or "upload.pdf"
-    pages, ocr_n = _extract_or_400(data, filename)
+    pages, ocr_n = _extract_cached(data, filename)
     if sum(len(p) for p in pages) <= 200:
         if OCR_OK:
             detail = ("Could not extract usable text from this PDF — it may be a scanned image. "
@@ -562,7 +594,7 @@ async def bills_extract(
 ):
     data = await _read_upload_pdf(file)
     filename = file.filename or "bill.pdf"
-    pages, _ = _extract_or_400(data, filename)
+    pages, _ = _extract_cached(data, filename)
     text = "\n".join(pages)
     if len(text.strip()) < 100:
         if OCR_OK:

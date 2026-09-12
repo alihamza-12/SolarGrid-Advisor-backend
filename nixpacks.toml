@@ -1,0 +1,6 @@
+# SolarGrid Advisor backend — Railway/Nixpacks build config.
+# Nixpacks auto-reads this file from the app root (this folder).
+# Installs the Tesseract OCR engine (+ English & Urdu language data) so that
+# scanned / image-only PDFs can be read. Nothing else in the build changes.
+[phases.setup]
+aptPkgs = ["...", "tesseract-ocr", "tesseract-ocr-eng", "tesseract-ocr-urd"]

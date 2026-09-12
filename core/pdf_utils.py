@@ -1,8 +1,19 @@
-"""PDF text extraction (+ optional OCR) — ported from app.py lines 335-380."""
+"""PDF text extraction (+ OCR for scanned pages) — ported from app.py lines 335-380.
+
+Two-pass strategy:
+  1. Fast text pass (pdfplumber) over all pages.
+  2. OCR pass (Tesseract) only for pages with almost no text — rasterized with
+     pypdfium2 and read by several Tesseract workers in parallel, so even a
+     96-page scan finishes in a few minutes inside ~1 GB RAM.
+
+Env knobs: SGA_OCR_DPI (default 150), SGA_OCR_WORKERS (default 3),
+SGA_OCR_LANG (default "" = eng+urd when Urdu data is installed, else eng).
+"""
 from __future__ import annotations
 
 import io
 import logging
+import os
 import shutil
 
 # pdfminer/pdfplumber are chatty: real-world PDFs (common in DISCO bills and
@@ -21,10 +32,44 @@ except Exception:
 
 try:
     import pytesseract
-    TESS_BIN = shutil.which("tesseract") is not None
-    OCR_OK = bool(TESS_BIN)
+    OCR_OK = shutil.which("tesseract") is not None
 except Exception:
+    pytesseract = None  # type: ignore[assignment]
     OCR_OK = False
+
+try:
+    import pypdfium2 as pdfium
+    PDFIUM_OK = True
+except Exception:
+    PDFIUM_OK = False
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))  # type: ignore[arg-type]
+    except Exception:
+        return default
+
+
+OCR_DPI = _int_env("SGA_OCR_DPI", 150)
+OCR_WORKERS = max(1, _int_env("SGA_OCR_WORKERS", 3))
+OCR_LANG_ENV = os.environ.get("SGA_OCR_LANG", "").strip()
+
+_ocr_lang_cache: str | None = None
+
+
+def _ocr_lang() -> str:
+    """Tesseract language(s): explicit env override, else eng+urd if available."""
+    global _ocr_lang_cache
+    if OCR_LANG_ENV:
+        return OCR_LANG_ENV
+    if _ocr_lang_cache is None:
+        try:
+            have = list(pytesseract.get_languages())
+        except Exception:
+            have = []
+        _ocr_lang_cache = "eng+urd" if "urd" in have else "eng"
+    return _ocr_lang_cache
 
 
 def is_pdf_bytes(data: bytes) -> bool:
@@ -40,8 +85,85 @@ def _is_encrypted(data: bytes) -> bool:
         return False
 
 
+def _tess_image(img, lang: str) -> str:
+    try:
+        return (pytesseract.image_to_string(img, lang=lang) or "").strip()
+    except Exception:
+        return ""
+
+
+def _ocr_pages_fast(data: bytes, indices: list[int]) -> dict[int, str]:
+    """Raster + OCR the given 0-based page indices with parallel workers.
+
+    Pages are rasterized one at a time (cheap) while a small pool of Tesseract
+    subprocesses (the slow part) runs concurrently; a semaphore bounds how many
+    page images wait in memory so RAM stays flat regardless of page count.
+    """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    lang = _ocr_lang()
+    scale = max(1.0, OCR_DPI / 72.0)
+    out: dict[int, str] = {}
+    sem = threading.Semaphore(max(1, OCR_WORKERS * 2))
+
+    def _run(img):
+        try:
+            return _tess_image(img, lang)
+        finally:
+            sem.release()
+
+    try:
+        doc = pdfium.PdfDocument(data)
+    except Exception:
+        return {}
+    try:
+        with ThreadPoolExecutor(max_workers=OCR_WORKERS, thread_name_prefix="ocr") as pool:
+            futs = {}
+            for idx in indices:
+                try:
+                    page = doc[idx]
+                    bitmap = page.render(scale=scale)
+                    img = bitmap.to_pil().convert("L")
+                except Exception:
+                    continue
+                sem.acquire()
+                try:
+                    futs[pool.submit(_run, img)] = idx
+                except Exception:
+                    sem.release()
+            for fut in as_completed(futs):
+                try:
+                    out[futs[fut]] = fut.result()
+                except Exception:
+                    pass
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
+    return out
+
+
+def _ocr_pages_legacy(data: bytes, indices: list[int]) -> dict[int, str]:
+    """Sequential OCR via pdfplumber rendering (used only if pypdfium2 is missing)."""
+    out: dict[int, str] = {}
+    lang = _ocr_lang()
+    try:
+        with pdfplumber.open(io.BytesIO(data)) as pdf:
+            for i in indices:
+                try:
+                    img = pdf.pages[i].to_image(resolution=170).original.convert("L")
+                    out[i] = _tess_image(img, lang)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return out
+
+
 def extract_pdf_pages(data: bytes) -> tuple[list[str], int]:
-    """Return (page_texts, n_ocr_pages). Uses pdfplumber; OCR fallback for scanned pages.
+    """Return (page_texts, n_ocr_pages). Text pass first, OCR only for scanned pages.
 
     Raises:
         ValueError: if the bytes are not a PDF or the PDF is password-protected.
@@ -61,51 +183,42 @@ def extract_pdf_pages(data: bytes) -> tuple[list[str], int]:
             raise ValueError("encrypted")
 
     pages: list[str] = []
-    ocr_pages = 0
     if PDF_OK:
         try:
-            buf = io.BytesIO(data)
-            with pdfplumber.open(buf) as pdf:
+            with pdfplumber.open(io.BytesIO(data)) as pdf:
                 for page in pdf.pages:
                     # One bad page must not kill the whole document.
                     try:
-                        t = (page.extract_text() or "").strip()
+                        pages.append((page.extract_text() or "").strip())
                     except Exception:
-                        t = ""
-                    if len(t) < 40 and OCR_OK:
-                        t2 = _ocr_page(page)
-                        if t2 and len(t2) > len(t):
-                            t = t2
-                            ocr_pages += 1
-                    pages.append(t)
-            if pages:
-                return pages, ocr_pages
+                        pages.append("")
         except Exception:
             pages = []
-    # Fallback: pypdf (no OCR)
-    try:
-        from pypdf import PdfReader
-        reader = PdfReader(io.BytesIO(data))
-        for p in reader.pages:
-            try:
-                pages.append((p.extract_text() or "").strip())
-            except Exception:
-                pages.append("")
-        return pages, 0
-    except Exception:
-        return [""], 0
-
-
-def _ocr_page(page) -> str:
-    try:
-        # Needs pypdfium2 (see requirements.txt) to rasterize the page.
-        img = page.to_image(resolution=170).original
-        langs = None
+    if not pages:
+        # Fallback: pypdf (no OCR)
         try:
-            langs = " ".join(pytesseract.get_languages())
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(data))
+            for p in reader.pages:
+                try:
+                    pages.append((p.extract_text() or "").strip())
+                except Exception:
+                    pages.append("")
+            return pages, 0
         except Exception:
-            pass
-        lang = "eng+urd" if langs and "urd" in langs else "eng"
-        return (pytesseract.image_to_string(img, lang=lang) or "").strip()
-    except Exception:
-        return ""
+            return [""], 0
+
+    # OCR pass: only pages with almost no native text (scanned/image pages).
+    ocr_n = 0
+    if OCR_OK:
+        need = [i for i, t in enumerate(pages) if len(t) < 40]
+        if need:
+            try:
+                results = _ocr_pages_fast(data, need) if PDFIUM_OK else _ocr_pages_legacy(data, need)
+            except Exception:
+                results = {}
+            for i, t2 in results.items():
+                if t2 and len(t2) > len(pages[i]):
+                    pages[i] = t2
+                    ocr_n += 1
+    return pages, ocr_n

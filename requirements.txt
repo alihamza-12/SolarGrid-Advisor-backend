@@ -1,19 +1,18 @@
 # SolarGrid Advisor backend — Python dependencies (LIGHT / low-RAM build)
 # Install:  pip install -r requirements.txt
 #
-# This is the lightweight variant: keyword (BM25) retrieval only, no torch.
-# It runs in well under 100 MB RAM, so it fits small hosts (e.g. Railway trial).
-# Everything works — chat, citations, filters, bills, calculators — except
-# vector (semantic) search, which needs the full build below.
+# Lightweight variant: keyword (BM25) retrieval only, no torch. It idles well
+# under 100 MB RAM, so it fits small hosts (e.g. Railway trial). Everything
+# works — chat, citations, filters, bills, calculators, scanned-PDF OCR —
+# except vector (semantic) search, which needs the full build below.
+# (OCR of very large scans briefly uses a few hundred MB while it runs.)
 #
 # FULL BUILD (local / bigger server, vector search + reranker):
 #   pip install sentence-transformers>=3.0 faiss-cpu>=1.8
 #
-# SCANNED-PDF OCR (local only — needs the Tesseract *system* package too,
-# e.g. on Ubuntu: sudo apt install tesseract-ocr tesseract-ocr-urd):
-#   pip install pypdfium2>=4.0 pytesseract>=0.3.10 Pillow>=10.0
-# (OCR is auto-detected: without these packages the app simply reports
-# ocr_available=false and text-based PDFs are unaffected.)
+# NOTE: OCR needs the Tesseract *system* package, installed on Railway via
+# nixpacks.toml. Locally (Ubuntu/Debian):
+#   sudo apt install tesseract-ocr tesseract-ocr-eng tesseract-ocr-urd
 
 # --- Web framework ---
 fastapi>=0.111
@@ -23,9 +22,12 @@ python-multipart>=0.0.9
 # --- LLM client (OpenAI-compatible: xAI Grok / Modal gpt-oss-120b / Ollama) ---
 openai>=1.40
 
-# --- PDF text extraction (pure text; no model, no OCR engine) ---
+# --- PDF text extraction + OCR for scanned PDFs ---
 pdfplumber>=0.11
 pypdf>=4.0
+pypdfium2>=4.0
+pytesseract>=0.3.10
+Pillow>=10.0
 
 # --- Data ---
 numpy>=1.24
